@@ -1,0 +1,3187 @@
+---
+title: "D1 Volume Analysis"
+output: html_document
+date: "2026-04-02"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+# Part 1: Data processing
+## Setup
+```{r libraries}
+library(tidyverse)
+library(dplyr)
+library(performance)
+library(brglm2)
+
+library(detectseparation)
+
+output_dir <- "results"
+load_input <- function(name) NULL
+save_checkpoint <- function(object, name) invisible(object)
+load_checkpoint <- function(name) NULL
+save_docx <- function(x, path, ...) flextable::save_as_docx(x, path = path, ...)
+print_docx <- function(doc, target) print(doc, target = target)
+
+plot_swelling_boxplot <- function(data, aes_x, aes_y, aes_colour = NULL,
+                                 facet_var = NULL, colours = NULL, colour_labels = NULL,
+                                 boxplot_width = 0.4, jitter_width = 0.13, jitter_size = 2.2,
+                                 title = NULL, subtitle = NULL, xlab = NULL, ylab = "Value (units as per panel label)",
+                                 x_labels = NULL, legend_title = NULL, legend_pos = "none", seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  p <- ggplot(data, aes(x = {{ aes_x }}, y = {{ aes_y }})) +
+    geom_boxplot(outlier.shape = NA, width = boxplot_width, colour = "grey50", fill = NA) +
+    geom_jitter(aes(colour = {{ aes_colour }}), width = jitter_width, height = 0,
+                size = jitter_size, alpha = 0.85)
+  
+  if (!is.null(facet_var)) {
+    p <- p + facet_wrap(facet_var, scales = "free_y", nrow = 1)
+  }
+  
+  if (!is.null(colours)) {
+    p <- p + scale_colour_manual(values = colours, labels = colour_labels)
+  }
+  
+  if (!is.null(x_labels)) {
+    p <- p + scale_x_discrete(labels = x_labels)
+  }
+  
+  p <- p +
+    labs(x = xlab, y = ylab, title = title, subtitle = subtitle, colour = legend_title) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = legend_pos,
+          strip.background = element_rect(fill = "#1F4E79"),
+          strip.text = element_text(colour = "white", face = "bold"),
+          panel.grid.major.x = element_blank())
+  
+  p
+}
+```
+## Import data
+```{r import}
+centreA <- load_input("centreA")
+centreB <- load_input("centreB")
+centreC <- load_input("centreC")
+```
+## Clean and combine
+```{r clean}
+clean_sheet <- function(df) df |> select(where(~ !all(is.na(.))))
+
+centreA <- clean_sheet(centreA)
+centreB <- clean_sheet(centreB) |> filter(!if_all(everything(), is.na))
+centreC <- clean_sheet(centreC)
+
+numeric_cols <- names(centreA)[map_lgl(centreA, is.numeric)]
+
+coerce_numeric <- function(df) {
+  df |> mutate(across(any_of(numeric_cols), as.numeric))
+}
+
+centreB <- coerce_numeric(centreB)
+centreC <- coerce_numeric(centreC)
+```
+## CentreA CTCAE GU correction
+```{r centreA-tox-correction}
+
+centreA_tox_lookup <- load_input("centreA_cumulative_tox") |>
+  rename(
+    patient_id      = 1,
+    baseline_xl     = 2,
+    lf_ctcae_gu     = 3,
+    `4wk_ctcae_gu`  = 4,
+    `12wk_ctcae_gu` = 5
+  ) |>
+  select(patient_id, lf_ctcae_gu, `4wk_ctcae_gu`, `12wk_ctcae_gu`) |>
+  filter(!is.na(patient_id)) |>
+  mutate(
+    across(c(lf_ctcae_gu, `4wk_ctcae_gu`, `12wk_ctcae_gu`), as.numeric),
+    id = as.numeric(row_number())
+  ) |>
+  select(id, lf_ctcae_gu, `4wk_ctcae_gu`, `12wk_ctcae_gu`)
+
+centreA <- centreA |>
+  rows_update(centreA_tox_lookup, by = "id")
+
+cat("CentreA CTCAE GU grades updated from cumulative data.\n")
+```
+## Combine into D1
+```{r combine-d1}
+d1 <- bind_rows(centreA, centreB, centreC) |>
+  filter(!is.na(Centre)) |>
+  mutate(Cohort = "D1", .before = Centre) |>
+  mutate(
+    cum_max_ctcae_gu = if_else(
+      Centre %in% c("centreA", "centreC"),
+      pmax(lf_ctcae_gu, `4wk_ctcae_gu`, `12wk_ctcae_gu`, na.rm = TRUE),
+      NA_real_
+    ),
+    gu_ge2_by_wk12 = cum_max_ctcae_gu >= 2
+  )
+
+cat("D1 cohort combined:\n")
+cat("  Observations:", nrow(d1), "\n")
+cat("  Unique patients:", n_distinct(d1$id), "\n")
+cat("  Centres:", paste(unique(d1$Centre), collapse = ", "), "\n\n")
+
+# Save checkpoint
+save_checkpoint(d1, "d1_combined")
+cat("Saved checkpoint: d1_combined\n\n")
+```
+## D1 Data Completeness Summary
+```{r d1-completeness}
+# D1 data completeness
+d1_t_stage <- round(sum(!is.na(d1$t_stage)) / nrow(d1) * 100, 1)
+d1_psa <- round(sum(!is.na(d1$baseline_psa)) / nrow(d1) * 100, 1)
+d1_adt <- round(sum(!is.na(d1$adt)) / nrow(d1) * 100, 1)
+d1_age <- round(sum(!is.na(d1$age)) / nrow(d1) * 100, 1)
+
+cat("D1 Cohort Data Completeness:\n")
+cat("  T stage: ", d1_t_stage, "%\n", sep = "")
+cat("  Pre-treatment PSA: ", d1_psa, "%\n", sep = "")
+cat("  ADT status: ", d1_adt, "%\n", sep = "")
+cat("  Age: ", d1_age, "%\n", sep = "")
+cat("  Clinical data overall: ", 
+    round(sum(!is.na(d1$t_stage) | !is.na(d1$baseline_psa) | !is.na(d1$age)) / nrow(d1) * 100, 1), "%\n\n", sep = "")
+```
+## Import Momentum cohorts (pipeline-derived: training + validation SBRT)
+```{r import-momentum}
+#| echo: false
+momentum_combined <- load_checkpoint("momentum_sbrt_combined_pipeline")
+
+cat("Combined Momentum SBRT cohort (loaded from pipeline export):\n")
+cat("  Total observations:", nrow(momentum_combined), "\n")
+cat("  Total unique patients:", n_distinct(momentum_combined$Patient_Id), "\n\n")
+
+save_checkpoint(momentum_combined, "momentum_combined_volumes")
+cat("Saved checkpoint: momentum_combined_volumes\n\n")
+```
+## Import clinical data from both Momentum cohorts
+```{r import-momentum-clinical, include=FALSE}
+momentum_ids_clean <- momentum_combined |>
+  mutate(Patient_Id_clean = as.numeric(Patient_Id)) |>
+  distinct(Patient_Id_clean) |>
+  pull(Patient_Id_clean)
+
+cat("=== STARTING UNIFIED CLINICAL DATA IMPORT ===\n")
+cat("Momentum cohort has:", length(momentum_ids_clean), "unique patients\n\n")
+
+define_columns_to_keep <- function(df) {
+  all_cols <- colnames(df)
+  keep_cols <- all_cols[!grepl("EQ5D5L|FU6M|FU12M|record_id_clean|TSG_OTHER|NON_PRIMARY_TUMOR_TYPE|PRE_CTCAE_TOX_OTHER_GRADE345_1", all_cols)]
+  keep_cols
+}
+
+# Load both clinical datasets
+cat("Loading SBRT clinical data...\n")
+sbrt_clinical_full <- load_input("clinical_momentum_1")
+cat("  Loaded:", nrow(sbrt_clinical_full), "records\n")
+
+cat("Loading validation clinical data...\n")
+validation_clinical_full <- load_input("clinical_momentum_2")
+cat("  Loaded:", nrow(validation_clinical_full), "records\n\n")
+
+# Process SBRT cohort
+cat("=== PROCESSING SBRT COHORT ===\n")
+sbrt_clinical <- sbrt_clinical_full |>
+  mutate(record_id_clean = as.numeric(sub("^0+", "", record_id))) |>
+  filter(record_id_clean %in% momentum_ids_clean)
+cat("  Filtered to momentum patients:", nrow(sbrt_clinical), "records\n")
+
+sbrt_cols_to_keep <- define_columns_to_keep(sbrt_clinical)
+clinical_sbrt <- sbrt_clinical |>
+  mutate(Patient_Id = sprintf("%05d", as.numeric(record_id))) |>
+  select(Patient_Id, all_of(sbrt_cols_to_keep)) |>
+  distinct(Patient_Id, .keep_all = TRUE) |>
+  mutate(across(!Patient_Id, as.character))
+cat("  Clinical variables extracted:", nrow(clinical_sbrt), "unique patients\n\n")
+
+# Process validation cohort
+cat("=== PROCESSING VALIDATION COHORT ===\n")
+validation_clinical <- validation_clinical_full |>
+  mutate(record_id_clean = as.numeric(sub("^0+", "", record_id))) |>
+  filter(record_id_clean %in% momentum_ids_clean)
+cat("  Filtered to momentum patients:", nrow(validation_clinical), "records\n")
+
+validation_cols_to_keep <- define_columns_to_keep(validation_clinical)
+clinical_validation <- validation_clinical |>
+  mutate(Patient_Id = sprintf("%05d", as.numeric(record_id))) |>
+  select(Patient_Id, all_of(validation_cols_to_keep)) |>
+  distinct(Patient_Id, .keep_all = TRUE) |>
+  mutate(across(!Patient_Id, as.character))
+cat("  Clinical variables extracted:", nrow(clinical_validation), "unique patients\n\n")
+
+# Stack both clinical datasets (rbind)
+cat("=== COMBINING CLINICAL DATASETS ===\n")
+common_cols <- intersect(colnames(clinical_sbrt), colnames(clinical_validation))
+cat("  Common columns between cohorts:", length(common_cols), "\n")
+
+# Stack with only common columns
+clinical_combined <- bind_rows(
+  clinical_sbrt |> select(all_of(common_cols)),
+  clinical_validation |> select(all_of(common_cols))
+)
+
+clinical_combined <- clinical_combined |>
+  distinct(Patient_Id, .keep_all = TRUE)
+
+cat("  Combined dataset: ", nrow(clinical_combined), "unique patients, ", ncol(clinical_combined), "columns\n\n")
+
+cat("=== JOINING TO VOLUME DATA ===\n")
+
+momentum_combined <- momentum_combined |>
+  mutate(Patient_Id_numeric = as.numeric(Patient_Id))
+
+clinical_combined <- clinical_combined |>
+  mutate(Patient_Id_numeric = as.numeric(Patient_Id))
+
+momentum_combined <- momentum_combined |>
+  left_join(
+    clinical_combined |> select(-Patient_Id),
+    by = "Patient_Id_numeric", 
+    relationship = "many-to-one"
+  ) |>
+  select(-Patient_Id_numeric)
+
+cat("  Join complete\n")
+cat("  Patient_Id format normalised for join\n")
+
+# Summary
+cat("=== CLINICAL DATA IMPORT COMPLETE ===\n")
+cat("Total patients in momentum_combined:", n_distinct(momentum_combined$Patient_Id), "\n")
+cat("momentum_combined dimensions:", nrow(momentum_combined), "rows x", ncol(momentum_combined), "columns\n\n")
+```
+## Consolidate clinical data columns
+```{r consolidate-clinical, include=FALSE}
+
+cat("=== CONSOLIDATING CLINICAL VARIABLES ===\n")
+
+if ("TREAT_OTHER_HORMONE_YN" %in% colnames(momentum_combined)) {
+  momentum_combined <- momentum_combined |>
+    mutate(ADT_Use = case_when(
+      TREAT_OTHER_HORMONE_YN %in% c("1", 1) ~ "Yes",
+      TREAT_OTHER_HORMONE_YN %in% c("0", 0) ~ "No",
+      TRUE ~ NA_character_
+    ))
+  cat("  ADT_Use derived from TREAT_OTHER_HORMONE_YN\n")
+} else {
+  cat("  TREAT_OTHER_HORMONE_YN not found -- ADT_Use not created\n")
+}
+
+classify_t_stage <- function(x) {
+  x <- toupper(trimws(x))
+  case_when(
+    is.na(x) | x %in% c("", "-1", "NA") ~ NA_character_,
+    grepl("^T1", x) ~ "T1",
+    grepl("^T2", x) ~ "T2",
+    grepl("^T3", x) ~ "T3",
+    grepl("^T4", x) ~ "T4",
+    TRUE ~ "Other"
+  )
+}
+
+if (all(c("BASE_C61_CLIN_T", "PRE_C61_CLIN_T") %in% colnames(momentum_combined))) {
+  momentum_combined <- momentum_combined |>
+    mutate(T_STAGE_GROUP = coalesce(
+      classify_t_stage(BASE_C61_CLIN_T),
+      classify_t_stage(PRE_C61_CLIN_T)
+    ))
+  cat("  T_STAGE_GROUP derived from BASE_C61_CLIN_T (fallback: PRE_C61_CLIN_T)\n")
+} else if ("BASE_C61_CLIN_T" %in% colnames(momentum_combined)) {
+  momentum_combined <- momentum_combined |>
+    mutate(T_STAGE_GROUP = classify_t_stage(BASE_C61_CLIN_T))
+  cat("  T_STAGE_GROUP derived from BASE_C61_CLIN_T\n")
+} else {
+  cat("  BASE_C61_CLIN_T not found -- T_STAGE_GROUP not created\n")
+}
+
+if (all(c("IC_DATE", "YEAR_OF_BIRTH") %in% colnames(momentum_combined))) {
+  momentum_combined <- momentum_combined |>
+    mutate(AGE_DIAGNOSIS = as.integer(format(as.Date(IC_DATE, "%m/%d/%Y"), "%Y")) - as.numeric(YEAR_OF_BIRTH))
+  cat("  AGE_DIAGNOSIS derived from IC_DATE - YEAR_OF_BIRTH\n")
+} else {
+  cat("  IC_DATE and/or YEAR_OF_BIRTH not found -- AGE_DIAGNOSIS not created\n")
+}
+
+cat("\nADT_Use distribution (unique patients):\n")
+momentum_combined |> distinct(Patient_Id, .keep_all = TRUE) |> count(ADT_Use) |> print()
+cat("\nT_STAGE_GROUP distribution (unique patients):\n")
+momentum_combined |> distinct(Patient_Id, .keep_all = TRUE) |> count(T_STAGE_GROUP) |> print()
+cat("\nAGE_DIAGNOSIS summary (unique patients):\n")
+momentum_combined |> distinct(Patient_Id, .keep_all = TRUE) |> pull(AGE_DIAGNOSIS) |> summary() |> print()
+cat("\n")
+
+# Save checkpoint
+save_checkpoint(momentum_combined, "momentum_combined_consolidated")
+cat("✓ Saved checkpoint: momentum_combined_consolidated\n\n")
+```
+## Update ADT_Use from June 2026 data extract
+```{r update-adt, include=FALSE}
+adt_update <- load_input("clinical_momentum_adt_update") |>
+  filter(!is.na(record_id)) |>
+  mutate(
+    Patient_Id_numeric = record_id,
+    ADT_Use_new = case_when(
+      TREAT_OTHER_HORMONE_YN == 1  ~ "Yes",
+      TREAT_OTHER_HORMONE_YN == 0  ~ "No",
+      TRUE                         ~ NA_character_
+    )
+  ) |>
+  filter(!is.na(ADT_Use_new)) |>
+  select(Patient_Id_numeric, ADT_Use_new)
+
+cat("ADT update file loaded:\n")
+cat("  Rows with usable ADT value:", nrow(adt_update), "\n")
+cat("  Yes:", sum(adt_update$ADT_Use_new == "Yes"), 
+    "| No:", sum(adt_update$ADT_Use_new == "No"), "\n\n")
+
+n_before <- sum(!is.na(momentum_combined$ADT_Use))
+
+momentum_combined <- momentum_combined |>
+  mutate(Patient_Id_numeric = as.numeric(Patient_Id)) |>
+  left_join(adt_update, by = "Patient_Id_numeric") |>
+  mutate(
+    ADT_Use = if_else(!is.na(ADT_Use_new), ADT_Use_new, ADT_Use)
+  ) |>
+  select(-Patient_Id_numeric, -ADT_Use_new)
+
+n_after <- sum(!is.na(momentum_combined$ADT_Use))
+
+cat("ADT_Use updated:\n")
+cat("  Non-NA before:", n_before, "\n")
+cat("  Non-NA after: ", n_after, "(+", n_after - n_before, "patients)\n\n")
+
+momentum_combined <- momentum_combined |>
+  mutate(ADT_Use = case_when(
+    ADT_Use == "Y" ~ "Yes",
+    ADT_Use == "N" ~ "No",
+    TRUE           ~ ADT_Use
+  ))
+
+cat("ADT_Use distribution (MOM, after normalisation):\n")
+momentum_combined |>
+  filter(Cohort == "MOM") |>
+  distinct(Patient_Id, .keep_all = TRUE) |>
+  count(ADT_Use, name = "n") |>
+  print()
+```
+## Clean up date columns (keep key dates only)
+```{r cleanup-dates, include=FALSE}
+
+cat("=== CLEANING UP DATE COLUMNS ===\n\n")
+
+dates_to_keep <- c(
+  "IC_DATE",
+  "BASE_PRIMARY_TUMOR_DATE",
+  "TREAT_RT_PHASE_1_START_DATE",
+  "TREAT_RT_PHASE_1_END_DATE",
+  "EOS_END_DATE",
+  "EOS_DEATH_DATE"
+)
+
+dates_to_keep <- dates_to_keep[dates_to_keep %in% colnames(momentum_combined)]
+
+# Remove all other date columns
+dates_to_remove <- grep("DATE|date", colnames(momentum_combined), value = TRUE)
+dates_to_remove <- setdiff(dates_to_remove, dates_to_keep)
+
+momentum_combined <- momentum_combined |>
+  select(-all_of(dates_to_remove))
+
+cat("Kept dates:", length(dates_to_keep), "\n")
+cat("Removed dates:", length(dates_to_remove), "\n")
+cat("momentum_combined now has:", ncol(momentum_combined), "columns\n\n")
+```
+## Exclude MOMENTUM patients: T3/T4 clinical stage, baseline PSA > 20, or Gleason Grade Group 4/5
+```{r exclude-mom-tstage-psa}
+mom_psa_numeric <- suppressWarnings(as.numeric(momentum_combined$PRE_C61_PSA))
+
+excl_stage <- momentum_combined$Cohort == "MOM" &
+  momentum_combined$T_STAGE_GROUP %in% c("T3", "T4")
+excl_psa <- momentum_combined$Cohort == "MOM" &
+  !is.na(mom_psa_numeric) & mom_psa_numeric > 20
+
+mom_gleason_primary   <- suppressWarnings(as.numeric(momentum_combined$PRE_C61_GLEASON_SCORE_PRIMARY))
+mom_gleason_secondary <- suppressWarnings(as.numeric(momentum_combined$PRE_C61_GLEASON_SCORE_SECONDARY))
+mom_gleason_total     <- mom_gleason_primary + mom_gleason_secondary
+mom_grade_group <- case_when(
+  is.na(mom_gleason_primary) | is.na(mom_gleason_secondary)     ~ NA_character_,
+  mom_gleason_primary <= 3 & mom_gleason_secondary <= 3          ~ "GG1",
+  mom_gleason_primary == 3 & mom_gleason_secondary == 4          ~ "GG2",
+  mom_gleason_primary == 4 & mom_gleason_secondary == 3          ~ "GG3",
+  mom_gleason_total == 8                                          ~ "GG4",
+  mom_gleason_total >= 9                                          ~ "GG5",
+  TRUE ~ NA_character_
+)
+excl_gg <- momentum_combined$Cohort == "MOM" &
+  !is.na(mom_grade_group) & mom_grade_group %in% c("GG4", "GG5")
+
+mom_ids_before <- momentum_combined |> filter(Cohort == "MOM") |> distinct(Patient_Id) |> nrow()
+excl_ids <- unique(momentum_combined$Patient_Id[excl_stage | excl_psa | excl_gg])
+
+n_mom_pre_sap_excl <- mom_ids_before
+n_excl_stage_only  <- n_distinct(momentum_combined$Patient_Id[excl_stage])
+n_excl_psa_only    <- n_distinct(momentum_combined$Patient_Id[excl_psa])
+n_excl_gg_only     <- n_distinct(momentum_combined$Patient_Id[excl_gg])
+n_excl_sap_total   <- length(excl_ids)
+
+cat("=== MOMENTUM EXCLUSION: T-STAGE (T3/T4), BASELINE PSA > 20, GG4/GG5 ===\n")
+cat("  MOMENTUM patients before exclusion:", mom_ids_before, "\n")
+cat("  Excluded for T3/T4 stage: ", n_excl_stage_only, "\n")
+cat("  Excluded for PSA > 20:    ", n_excl_psa_only, "\n")
+cat("  Excluded for GG4/GG5:     ", n_excl_gg_only, "\n")
+cat("  Excluded for stage & PSA (overlap):     ", n_distinct(momentum_combined$Patient_Id[excl_stage & excl_psa]), "\n")
+cat("  Excluded for stage & GG (overlap):      ", n_distinct(momentum_combined$Patient_Id[excl_stage & excl_gg]), "\n")
+cat("  Excluded for PSA & GG (overlap):        ", n_distinct(momentum_combined$Patient_Id[excl_psa & excl_gg]), "\n")
+cat("  Total excluded (unique):  ", n_excl_sap_total, "\n")
+
+momentum_combined <- momentum_combined |>
+  filter(!(Patient_Id %in% excl_ids))
+
+n_mom_post_sap_excl <- momentum_combined |> filter(Cohort == "MOM") |> distinct(Patient_Id) |> nrow()
+mom_ids_after <- n_mom_post_sap_excl
+cat("  MOMENTUM patients after exclusion:", mom_ids_after, "\n\n")
+
+save_checkpoint(momentum_combined, "momentum_combined_stage_psa_filtered")
+cat("Saved checkpoint: momentum_combined_stage_psa_filtered\n\n")
+```
+## Merge D1 volume and clinical data with momentum_combined
+```{r merge-d1-with-momentum, include=FALSE}
+
+cat("=== MERGING D1 COHORT WITH MOMENTUM_COMBINED ===\n\n")
+
+max_momentum_id <- momentum_combined |>
+  pull(Patient_Id) |>
+  as.numeric() |>
+  max(na.rm = TRUE)
+
+cat("Max existing momentum Patient_Id:", max_momentum_id, "\n")
+cat("D1 patients will be assigned IDs:", max_momentum_id + 1, "to", max_momentum_id + nrow(d1), "\n\n")
+
+d1_transformed <- d1 |>
+  mutate(
+    Patient_Id = sprintf("%05d", seq(max_momentum_id + 1, max_momentum_id + n())),
+    D1_id = id,
+    
+    STUDY_SITE = Centre,
+    PRE_C61_PSA = baseline_psa,
+    PRE_CTCAE_GU_max_grade = baseline_ctcae_gu,
+    FU3M_CTCAE_GU_max_grade = cum_max_ctcae_gu,
+    
+    .keep = "all"
+  ) |>
+  select(
+    Patient_Id, D1_id, Cohort, STUDY_SITE,
+    age, ethnicity, ps,
+    baseline_pvol, gleason, t_stage, adt,
+    PRE_C61_PSA, PRE_CTCAE_GU_max_grade,
+    baseline_ipss_tot, baseline_ipss_qol, baseline_epic_uo, baseline_epic_ui,
+    lf_ctcae_gu, lf_ipss_tot, lf_ipss_qol,
+    `4wk_ctcae_gu`, `4wk_ipss_tot`, `4wk_ipss_qol`, `4wk_epic_uo`, `4wk_epic_ui`,
+    FU3M_CTCAE_GU_max_grade, `12wk_ipss_tot`, `12wk_ipss_qol`, `12wk_epic_uo`, `12wk_epic_ui`, `12wk_psa`,
+    fx1_ctv_vol, fx2_ctv_vol, fx3_ctv_vol, fx4_ctv_vol, fx5_ctv_vol
+  )
+
+cat("D1 data transformed:", nrow(d1_transformed), "patients x", ncol(d1_transformed), "columns\n\n")
+
+# Get data types from momentum_combined
+get_mom_type <- function(col) {
+  if (col %in% colnames(momentum_combined)) {
+    class(momentum_combined[[col]])[1]
+  } else {
+    "character"
+  }
+}
+
+for (col in colnames(d1_transformed)) {
+  mom_type <- get_mom_type(col)
+  
+  if (mom_type == "numeric") {
+    d1_transformed[[col]] <- as.numeric(d1_transformed[[col]])
+  } else if (mom_type == "integer") {
+    d1_transformed[[col]] <- as.integer(d1_transformed[[col]])
+  } else {
+    d1_transformed[[col]] <- as.character(d1_transformed[[col]])
+  }
+}
+
+momentum_cols <- colnames(momentum_combined)
+d1_transformed_cols <- colnames(d1_transformed)
+cols_missing_in_d1 <- setdiff(momentum_cols, d1_transformed_cols)
+
+na_cols_list <- list()
+for (col in cols_missing_in_d1) {
+  mom_type <- class(momentum_combined[[col]])[1]
+  if (mom_type == "numeric") {
+    na_cols_list[[col]] <- NA_real_
+  } else if (mom_type == "integer") {
+    na_cols_list[[col]] <- NA_integer_
+  } else if (mom_type == "Date") {
+    na_cols_list[[col]] <- NA_character_ |> as.Date()
+  } else if (mom_type == "POSIXct") {
+    na_cols_list[[col]] <- as.POSIXct(NA_character_)
+  } else {
+    na_cols_list[[col]] <- NA_character_
+  }
+}
+
+d1_padded <- d1_transformed |>
+  bind_cols(na_cols_list) |>
+  select(all_of(momentum_cols), everything())
+
+cat("D1 padded with", length(cols_missing_in_d1), "momentum-specific columns (as NA)\n\n")
+
+momentum_combined <- bind_rows(momentum_combined, d1_padded)
+
+cat("=== FINAL COMBINED DATASET ===\n")
+cat("Total unique patients:", n_distinct(momentum_combined$Patient_Id), "\n")
+cat("Total rows:", nrow(momentum_combined), "\n")
+cat("Total columns:", ncol(momentum_combined), "\n\n")
+cat("\u2713 D1 data merged successfully. momentum_combined is now the combined dataset.\n\n")
+
+# Save checkpoint
+save_checkpoint(momentum_combined, "momentum_d1_combined")
+cat("\u2713 Saved checkpoint: momentum_d1_combined\n\n")
+```
+## CONSORT-style Patient Flow Summary
+```{r consort-summary}
+#| echo: false
+
+cat("\n")
+cat("+----------------------------------------------------------------------------+\n")
+cat("|                    PATIENT FLOW THROUGH ANALYSIS PIPELINE                  |\n")
+cat("+----------------------------------------------------------------------------+\n\n")
+
+cat("+- D1 COHORT (3 Centres: CentreA, CentreC, CentreB) ------------------------------------+\n")
+centreA_n <- n_distinct(centreA$id)
+centreB_n <- n_distinct(centreB$id)
+centreC_n <- n_distinct(centreC$id)
+d1_n <- n_distinct(d1$id)
+cat(sprintf("  CentreA centre:                        %4d patients\n", centreA_n))
+cat(sprintf("  CentreB centre:                        %4d patients\n", centreB_n))
+cat(sprintf("  CentreC centre:                        %4d patients\n", centreC_n))
+cat(sprintf("  --------------------------------------------\n"))
+cat(sprintf("  D1 TOTAL (combined):               %4d patients\n", d1_n))
+cat("\n")
+
+cat("+- MOMENTUM COHORT (pipeline-derived: training + validation SBRT) ---------+\n")
+mom_patients_n <- n_distinct(momentum_combined$Patient_Id[momentum_combined$Cohort == "MOM"], na.rm = TRUE)
+cat(sprintf("  Combined SBRT training + validation patients: %4d\n", mom_patients_n))
+cat("  (Training + validation cohorts from the upstream data-preparation pipeline)\n")
+cat(sprintf("  MOMENTUM TOTAL:                    %4d unique patients\n", n_distinct(momentum_combined$Patient_Id)))
+cat(sprintf("    (volume measurements: %d rows)\n", nrow(momentum_combined)))
+cat("\n")
+cat("+- FINAL MERGED DATASET -----------------------------------------------------+\n")
+final_total <- n_distinct(momentum_combined$Patient_Id)
+mom_only <- n_distinct(momentum_combined$Patient_Id[momentum_combined$Cohort == "MOM"], na.rm = TRUE)
+d1_in_final <- n_distinct(momentum_combined$Patient_Id[momentum_combined$Cohort == "D1"], na.rm = TRUE)
+
+cat(sprintf("  Momentum cohort (already counted): %4d patients\n", mom_only))
+cat(sprintf("  D1 cohort (newly added):           %4d patients\n", d1_in_final))
+cat(sprintf("  --------------------------------------------\n"))
+cat(sprintf("  GRAND TOTAL:                       %4d unique patients\n", final_total))
+cat(sprintf("    (total volume measurements: %d rows)\n", nrow(momentum_combined)))
+cat("\n")
+
+cat("+- COMPLETENESS BY COHORT ----------------------------------------------------+\n")
+cat("\n  D1 Cohort Data Completeness:\n")
+cat(sprintf("    \u2713 T stage:           %3.1f%% complete (%d / %d)\n", 
+            sum(!is.na(d1$t_stage)) / nrow(d1) * 100, sum(!is.na(d1$t_stage)), nrow(d1)))
+cat(sprintf("    \u2713 Pre-treatment PSA: %3.1f%% complete (%d / %d)\n", 
+            sum(!is.na(d1$baseline_psa)) / nrow(d1) * 100, sum(!is.na(d1$baseline_psa)), nrow(d1)))
+cat(sprintf("    \u2713 ADT status:        %3.1f%% complete (%d / %d)\n", 
+            sum(!is.na(d1$adt)) / nrow(d1) * 100, sum(!is.na(d1$adt)), nrow(d1)))
+cat(sprintf("    \u2713 Age:               %3.1f%% complete (%d / %d)\n", 
+            sum(!is.na(d1$age)) / nrow(d1) * 100, sum(!is.na(d1$age)), nrow(d1)))
+
+cat("\n  Momentum Cohort Data Completeness (from clinical data):\n")
+mom_data <- momentum_combined |> filter(Cohort == "MOM") |> distinct(Patient_Id, .keep_all = TRUE)
+cat(sprintf("    \u2713 T stage:           %3.1f%% (%d / %d patients)\n", 
+            sum(!is.na(mom_data$T_stage)) / nrow(mom_data) * 100, sum(!is.na(mom_data$T_stage)), nrow(mom_data)))
+cat(sprintf("    \u2713 Pre-treatment PSA: %3.1f%% (%d / %d patients)\n", 
+            sum(!is.na(mom_data$PRE_C61_PSA)) / nrow(mom_data) * 100, sum(!is.na(mom_data$PRE_C61_PSA)), nrow(mom_data)))
+cat(sprintf("    \u2713 ADT status:        %3.1f%% (%d / %d patients)\n", 
+            sum(!is.na(mom_data$ADT_Use)) / nrow(mom_data) * 100, sum(!is.na(mom_data$ADT_Use)), nrow(mom_data)))
+cat(sprintf("    \u2713 Age:               %3.1f%% (%d / %d patients)\n", 
+            sum(!is.na(mom_data$AGE_DIAGNOSIS)) / nrow(mom_data) * 100, sum(!is.na(mom_data$AGE_DIAGNOSIS)), nrow(mom_data)))
+
+cat("\n+----------------------------------------------------------------------------+\n\n")
+```
+# Part 2: Analysis
+## Load Processed Data
+```{r load-checkpoints}
+if (!exists("momentum_combined")) {
+  momentum_combined <- load_checkpoint("momentum_d1_combined")
+  cat("* Loaded momentum_combined from checkpoint\n")
+  cat("  Dimensions:", nrow(momentum_combined), "rows,", ncol(momentum_combined), "columns\n")
+  cat("  Unique patients:", n_distinct(momentum_combined$Patient_Id), "\n\n")
+} else {
+  cat("* momentum_combined already in memory (from earlier processing)\n\n")
+}
+```
+## Per-fraction % change from first available volume
+```{r pct-change}
+fx_cols <- c("fx1_ctv_vol", "fx2_ctv_vol", "fx3_ctv_vol", "fx4_ctv_vol", "fx5_ctv_vol")
+
+d1 <- d1 |>
+  rowwise() |>
+  mutate(
+    fx_ref = first(na.omit(c_across(all_of(fx_cols)))),
+    across(
+      all_of(fx_cols),
+      ~ round((. - fx_ref) / fx_ref * 100, 1),
+      .names = "{sub('_ctv_vol', '', .col)}_pct"
+    )
+  ) |>
+  ungroup()
+```
+```{r save-d1-pct}
+save_checkpoint(d1, "d1_pct")
+cat("Saved checkpoint: d1_pct\n")
+```
+```{r}
+d1 <- load_checkpoint("d1_pct")
+```
+## Effective radius and swelling metrics
+### Effective radius and Δr per fraction
+```{r delta-r}
+momentum_combined <- momentum_combined |>
+  mutate(
+    r_t_cm = if_else(!is.na(Volume), 
+                     (3 * Volume / (4 * pi)) ^ (1/3), 
+                     NA_real_)
+  ) |>
+  group_by(Patient_Id) |>
+  mutate(
+    r_ref_cm = first(na.omit(r_t_cm)),
+    delta_r_mm = if_else(!is.na(r_t_cm) & !is.na(r_ref_cm),
+                         10 * (r_t_cm - r_ref_cm),
+                         NA_real_)
+  ) |>
+  ungroup()
+
+cat("Effective radius and delta_r calculated:\n")
+cat("  Rows with r_t_cm:", sum(!is.na(momentum_combined$r_t_cm)), 
+    "(", n_distinct(momentum_combined$Patient_Id[!is.na(momentum_combined$r_t_cm)]), "unique patients)\n")
+cat("  Rows with delta_r_mm:", sum(!is.na(momentum_combined$delta_r_mm)), 
+    "(", n_distinct(momentum_combined$Patient_Id[!is.na(momentum_combined$delta_r_mm)]), "unique patients)\n")
+cat("  (Note: delta_r is relative to each patient's first available fraction, not necessarily Fx1)\n")
+```
+### D1 long-format volume prep
+```{r d1-long-prep}
+d1_long <- d1 |>
+  mutate(fx5_ctv_vol = if_else(Centre == "centreB" & id == 8, NA_real_, fx5_ctv_vol)) |>
+  select(Centre, id, starts_with("fx") & ends_with("_ctv_vol")) |>
+  pivot_longer(
+    cols          = starts_with("fx"),
+    names_to      = "Fraction",
+    values_to     = "Volume",
+    names_pattern = "fx([0-9])_ctv_vol"
+  ) |>
+  mutate(
+    Fraction = as.numeric(Fraction),
+    Centre   = as.character(Centre)
+  ) |>
+  filter(!is.na(Volume)) |>
+  mutate(patient_uid = paste(Centre, id, sep = "_"))
+
+cat("d1_long created:", nrow(d1_long), "rows,", n_distinct(d1_long$id), "unique patient IDs (NOT unique across centres),", 
+    n_distinct(d1_long$patient_uid), "unique patients (Centre + id, i.e. patient_uid)\n")
+```
+### Patient-level swelling metrics
+```{r swelling-metrics}
+# SAP helper functions
+vol_to_radius_cm <- function(V_cm3) (3 * V_cm3 / (4 * pi))^(1/3)
+
+compute_swelling_metrics <- function(df,
+                                     id_var   = "id",
+                                     frac_var = "fraction",
+                                     vol_var  = "vol_cm3") {
+  df |>
+    arrange(.data[[id_var]], .data[[frac_var]]) |>
+    group_by(.data[[id_var]]) |>
+    mutate(
+      r_cm     = vol_to_radius_cm(.data[[vol_var]]),
+      r1_cm    = first(r_cm),
+      dr_mm    = (r_cm - r1_cm) * 10,
+      frac_num = row_number()
+    ) |>
+    ungroup() |>
+    group_by(.data[[id_var]]) |>
+    summarise(
+      baseline_vol_cm3 = first(.data[[vol_var]]),
+      peak_dr_mm       = max(dr_mm, na.rm = TRUE),
+      burden_3mm       = sum(dr_mm >= 3, na.rm = TRUE),
+      burden_1mm       = sum(dr_mm >= 1, na.rm = TRUE),
+      frac_first_3mm   = if (any(dr_mm >= 3, na.rm = TRUE))
+                           min(frac_num[dr_mm >= 3], na.rm = TRUE)
+                         else NA_integer_,
+      mean_dr_first5   = mean(dr_mm[frac_num <= 5], na.rm = TRUE),
+      .groups          = "drop"
+    ) |>
+    mutate(peak_dr_mm = if_else(is.infinite(peak_dr_mm), NA_real_, peak_dr_mm))
+}
+
+# MOMENTUM
+mom_swelling <- compute_swelling_metrics(
+  momentum_combined |> filter(Cohort == "MOM", !is.na(Volume)),
+  id_var = "Patient_Id", frac_var = "Fraction", vol_var = "Volume"
+) |> mutate(Cohort = "MOM")
+
+# D1 (CentreA + CentreC only)
+d1_swelling <- d1_long |>
+  filter(as.character(Centre) %in% c("centreA", "centreC")) |>
+  compute_swelling_metrics(
+    id_var = "patient_uid", frac_var = "Fraction", vol_var = "Volume"
+  ) |>
+  mutate(
+    Cohort = "D1",
+    Centre = sub("_[^_]*$", "", patient_uid),
+    id     = as.numeric(sub(".*_", "", patient_uid))
+  )
+
+# Unified swelling object
+swelling <- bind_rows(
+  mom_swelling,
+  d1_swelling |> rename(Patient_Id = patient_uid)
+)
+
+momentum_combined <- momentum_combined |>
+  left_join(
+    swelling |> select(Patient_Id, Cohort,
+                       peak_dr_mm, burden_3mm, burden_1mm,
+                       frac_first_3mm, mean_dr_first5),
+    by = c("Patient_Id", "Cohort")
+  )
+
+cat("Swelling metrics calculated:\n")
+cat("  MOMENTUM:", nrow(mom_swelling), "patients\n")
+cat("  D1 (CentreA+CentreC):", nrow(d1_swelling), "patients\n\n")
+
+# Cohort comparison table
+bind_rows(
+  mom_swelling |> mutate(cohort = "MOMENTUM"),
+  d1_swelling  |> rename(Patient_Id = patient_uid) |> mutate(cohort = "D1")
+) |>
+  group_by(cohort) |>
+  summarise(
+    n_patients                          = n(),
+    median_peak_dr                      = round(median(peak_dr_mm, na.rm = TRUE), 2),
+    iqr_peak_dr                         = paste0(
+                                            round(quantile(peak_dr_mm, 0.25, na.rm = TRUE), 2),
+                                            "-",
+                                            round(quantile(peak_dr_mm, 0.75, na.rm = TRUE), 2)
+                                          ),
+    pct_peak_dr_3mm       = round(mean(peak_dr_mm >= 3, na.rm = TRUE) * 100, 1),
+    pct_peak_dr_1mm       = round(mean(peak_dr_mm >= 1, na.rm = TRUE) * 100, 1),
+    median_burden_3mm     = median(burden_3mm, na.rm = TRUE),
+    median_mean_dr_first5 = round(median(mean_dr_first5, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) |>
+  setNames(c("Cohort", "n", "Median peak dr (mm)", "IQR peak dr (mm)",
+             "Pct peak dr >= 3mm", "Pct peak dr >= 1mm", "Median burden (>=3mm)",
+             "Median mean dr fracs 1-5 (mm)"))
+```
+## Save combined dataset
+```{r save-dataset}
+save_checkpoint(momentum_combined, "momentum_combined_all")
+
+cat("=== DATASET SAVED ===\n")
+cat("File: momentum_combined_all\n")
+cat("Size:", object.size(momentum_combined) |> format(units = "Mb"), "\n")
+cat("Rows:", nrow(momentum_combined), "\n")
+cat("Columns:", ncol(momentum_combined), "\n")
+cat("Unique patients:", n_distinct(momentum_combined$Patient_Id), "\n\n")
+cat("Ready for downstream analysis.\n")
+
+momentum_combined <- load_checkpoint("momentum_combined_all")
+
+cat("Rows:", nrow(momentum_combined), "\n")
+cat("Columns:", ncol(momentum_combined), "\n")
+cat("Unique patients:", dplyr::n_distinct(momentum_combined$Patient_Id), "\n")
+```
+## D1 Swelling by Centre: Absolute Volumes Across Fractions
+```{r reload-all-rds}
+
+d1 <- load_checkpoint("d1_combined")
+cat("d1_combined loaded:", nrow(d1), "rows,", ncol(d1), "cols\n")
+
+momentum_combined <- load_checkpoint("momentum_d1_combined")
+cat("momentum_d1_combined loaded:", nrow(momentum_combined), "rows,", ncol(momentum_combined), "cols\n")
+
+cat("\nAll checkpoints loaded. Ready for analysis.\n")
+```
+## CONSORT Flow Diagram
+```{r consort-diagram}
+library(ggplot2)
+
+n_total     <- n_distinct(momentum_combined$Patient_Id)
+n_mom       <- n_distinct(momentum_combined$Patient_Id[momentum_combined$Cohort == "MOM"])
+n_d1        <- n_distinct(momentum_combined$Patient_Id[momentum_combined$Cohort == "D1"])
+n_obs_mom   <- sum(!is.na(momentum_combined$Volume) &
+                   momentum_combined$Fraction <= 5 &
+                   momentum_combined$Cohort == "MOM")
+
+n_mom_excl      <- 1L
+n_obs_mom_excl  <- 1L
+n_d1_sw         <- nrow(d1_swelling)
+n_d1_centreB_excl   <- n_d1 - n_d1_sw
+
+box <- function(x, y, w, h, label) data.frame(x = x, y = y, w = w, h = h, label = label)
+
+consort_boxes <- rbind(
+  box(2.2,  12.3, 4.2, 1.5, sprintf("Dest 1 cohort enrolled\nn = %d\n(20 per centre: CentreA, CentreB, CentreC)", n_d1)),
+  box(8.2,  12.3, 4.2, 1.3, sprintf("MOMENTUM SBRT cohort identified\nn = %d", n_mom_pre_sap_excl)),
+
+  box(8.2,  9.7, 4.6, 2.0, sprintf("Excluded:\nT-stage T3/T4, n = %d\nBaseline PSA > 20 ng/mL, n = %d\nGleason Grade Group 4/5, n = %d\n(criteria overlap)\nn = %d unique patients excluded", n_excl_stage_only, n_excl_psa_only, n_excl_gg_only, n_excl_sap_total)),
+
+  box(2.2,  7.0, 4.2, 1.9, sprintf("Excluded from swelling analysis:\nCentreB, n = %d\naggregate-level data only,\nprecludes patient-level metrics", n_d1_centreB_excl)),
+  box(8.2,  7.0, 4.2, 1.9, sprintf("Excluded:\nn = %d patient (>500%% volume increase, outlier)\nn = %d fraction-level observation\n(likely contouring/entry error)", n_mom_excl, n_obs_mom_excl)),
+
+  box(2.2,  3.9, 4.2, 1.4, sprintf("Dest 1 swelling analysis cohort\nn = %d (CentreA + CentreC)", n_d1_sw)),
+  box(8.2,  3.9, 4.2, 1.6, sprintf("MOMENTUM analysis cohort\nn = %d\nn = %s fraction-level observations\n(fractions 1\u20135)", n_mom, formatC(n_obs_mom, big.mark = ","))),
+
+  box(5.2,  1.2, 5.2, 1.5, sprintf("Combined dataset\nn = %d patients\n(Dest 1 n = %d, MOMENTUM n = %d)", n_total, n_d1, n_mom))
+)
+
+b_top <- function(i) consort_boxes$y[i] + consort_boxes$h[i] / 2
+b_bot <- function(i) consort_boxes$y[i] - consort_boxes$h[i] / 2
+b_x   <- function(i) consort_boxes$x[i]
+
+consort_arrows <- data.frame(
+  x    = c(b_x(1), b_x(2), b_x(3), b_x(4), b_x(5), b_x(6), b_x(7)),
+  xend = c(b_x(4), b_x(3), b_x(5), b_x(6), b_x(7), 4.5,    5.9),
+  y    = c(b_bot(1), b_bot(2), b_bot(3), b_bot(4), b_bot(5), b_bot(6), b_bot(7)),
+  yend = c(b_top(4), b_top(3), b_top(5), b_top(6), b_top(7), b_top(8), b_top(8))
+)
+
+consort_text_regular <- consort_boxes |> filter(y != 3.9)
+consort_text_d1_note <- consort_boxes |> filter(y == 3.9)
+
+p_consort <- ggplot() +
+  geom_rect(data = consort_boxes, aes(xmin = x - w/2, xmax = x + w/2, ymin = y - h/2, ymax = y + h/2),
+            fill = "white", colour = "black", linewidth = 0.5) +
+  geom_text(data = consort_text_regular, aes(x = x, y = y, label = label), size = 3.1, lineheight = 0.9) +
+  geom_text(data = consort_text_d1_note, aes(x = x, y = y, label = label), size = 2.7, lineheight = 0.9) +
+  geom_segment(data = consort_arrows, aes(x = x, xend = xend, y = y, yend = yend),
+               arrow = arrow(length = unit(0.12, "inches")), linewidth = 0.4) +
+  xlim(-0.2, 10.8) + ylim(-0.2, 13.5) +
+  labs(title = "CONSORT Flow Diagram: Dest 1 and MOMENTUM SBRT Cohorts") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 13),
+        plot.margin = margin(10, 10, 10, 10))
+
+consort_png <- file.path(output_dir, "consort_flow_diagram.png")
+ggsave(consort_png, p_consort, width = 9, height = 8.4, dpi = 300)
+
+cat("\u2713 CONSORT diagram built (p_consort, consort_png)\n")
+print(consort_png)
+```
+```{r d1-swelling-by-centre}
+library(ggplot2)
+library(tidyverse)
+
+p_d1_swelling <- ggplot(d1_long, aes(x = Fraction, y = Volume, group = patient_uid, color = Centre)) +
+  geom_line(alpha = 0.5, linewidth = 0.8) +
+  geom_point(size = 2, alpha = 0.6) +
+  facet_wrap(~Centre, nrow = 1) +
+  scale_x_continuous(breaks = 1:5) +
+  labs(
+    title = "Dest 1 Prostate CTV Volume Across Fractions by Centre",
+    x = "Fraction Number",
+    y = "CTV Volume (cm3)",
+    color = "Centre"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank(),
+    strip.text = element_text(face = "bold", size = 11),
+    plot.title = element_text(size = 12, face = "bold")
+  )
+
+# Display plot
+print(p_d1_swelling)
+```
+```{r d1-pct-change-by-centre}
+d1_pct <- d1_long |>
+  group_by(patient_uid) |>
+  mutate(
+    fx1_vol = first(Volume[Fraction == 1]),
+    pct_change = (Volume - fx1_vol) / fx1_vol * 100
+  ) |>
+  ungroup() |>
+  filter(Fraction != 1)
+
+p_d1_pct <- ggplot(d1_pct, aes(x = Fraction, y = pct_change, group = patient_uid, color = Centre)) +
+  geom_line(alpha = 0.5, linewidth = 0.8) +
+  geom_point(size = 2, alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~Centre, nrow = 1) +
+  scale_x_continuous(breaks = 2:5) +
+  labs(
+    title = "Dest 1 Prostate CTV: % Change from Fraction 1 by Centre",
+    x = "Fraction Number",
+    y = "% Change from Fraction 1",
+    color = "Centre"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank(),
+    strip.text = element_text(face = "bold", size = 11),
+    plot.title = element_text(size = 12, face = "bold")
+  )
+
+print(p_d1_pct)
+
+# Save as SVG
+ggsave(
+  filename = "D1_swelling_by_centre.svg",
+  path = output_dir,
+  plot = p_d1_swelling,
+  width = 12,
+  height = 6,
+  units = "in",
+  device = "svg"
+)
+
+cat("\u2713 Plot saved: D1_swelling_by_centre.svg\n")
+
+ggsave(
+  filename = "D1_pct_change_by_centre.svg",
+  path = output_dir,
+  plot = p_d1_pct,
+  width = 12,
+  height = 6,
+  units = "in",
+  device = "svg"
+)
+
+cat("\u2713 Plot saved: D1_pct_change_by_centre.svg\n")
+
+ggsave(
+  filename = "D1_swelling_by_centre.png",
+  path = output_dir,
+  plot = p_d1_swelling,
+  width = 12,
+  height = 6,
+  units = "in",
+  dpi = 300,
+  device = "png"
+)
+
+cat("\u2713 Plot saved: D1_swelling_by_centre.png\n")
+
+ggsave(
+  filename = "D1_pct_change_by_centre.png",
+  path = output_dir,
+  plot = p_d1_pct,
+  width = 12,
+  height = 6,
+  units = "in",
+  dpi = 300,
+  device = "png"
+)
+
+cat("\u2713 Plot saved: D1_pct_change_by_centre.png\n")
+```
+## D1 Swelling by Centre: Mean +/- 1 SD
+```{r d1-sd-by-centre, fig.width=12, fig.height=6}
+d1_changes <- d1_long |>
+  group_by(Centre, id) |>
+  mutate(
+    fx1_vol    = first(Volume[Fraction == 1]),
+    abs_change = Volume - fx1_vol,
+    pct_change = (Volume - fx1_vol) / fx1_vol * 100
+  ) |>
+  ungroup()
+
+d1_centre_n <- d1_changes |>
+  distinct(Centre, id) |>
+  count(Centre) |>
+  mutate(Centre = factor(Centre, levels = c("centreA", "centreC", "centreB"))) |>
+  arrange(Centre) |>
+  mutate(centre_label = factor(
+    paste0(toupper(as.character(Centre)), "\n(n=", n, ")"),
+    levels = unique(paste0(toupper(as.character(Centre)), "\n(n=", n, ")"))
+  ))
+
+d1_centre_summary <- d1_changes |>
+  group_by(Centre, Fraction) |>
+  summarise(
+    mean_abs = mean(abs_change, na.rm = TRUE),
+    sd_abs   = sd(abs_change, na.rm = TRUE),
+    mean_pct = mean(pct_change, na.rm = TRUE),
+    sd_pct   = sd(pct_change, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  left_join(d1_centre_n, by = "Centre")
+
+p_d1_abs_sd <- ggplot(d1_centre_summary, aes(x = Fraction)) +
+  geom_ribbon(aes(ymin = mean_abs - sd_abs, ymax = mean_abs + sd_abs),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = mean_abs), color = "steelblue", linewidth = 0.9) +
+  geom_point(aes(y = mean_abs), color = "steelblue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ centre_label, nrow = 1, scales = "free_y") +
+  scale_x_continuous(breaks = 1:5) +
+  labs(
+    title = "Dest 1: Mean Absolute Volume Change from Fraction 1 by Centre (+/- 1 SD)",
+    x = "Fraction Number",
+    y = "Absolute Volume Change (cm3)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+
+p_d1_pct_sd <- ggplot(d1_centre_summary, aes(x = Fraction)) +
+  geom_ribbon(aes(ymin = mean_pct - sd_pct, ymax = mean_pct + sd_pct),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = mean_pct), color = "steelblue", linewidth = 0.9) +
+  geom_point(aes(y = mean_pct), color = "steelblue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ centre_label, nrow = 1, scales = "free_y") +
+  scale_x_continuous(breaks = 1:5) +
+  labs(
+    title = "Dest 1: Mean % Change from Fraction 1 by Centre (+/- 1 SD)",
+    x = "Fraction Number",
+    y = "% Change from Fraction 1"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+
+print(p_d1_abs_sd)
+print(p_d1_pct_sd)
+
+d1_sd_plots_dir <- file.path(output_dir, "plots")
+d1_sd_files <- c(
+  "D1_abs_change_by_centre_sd.svg",
+  "D1_abs_change_by_centre_sd.png",
+  "D1_pct_change_by_centre_sd.svg",
+  "D1_pct_change_by_centre_sd.png"
+)
+d1_sd_out <- file.path(d1_sd_plots_dir, d1_sd_files)
+
+ggsave(d1_sd_out[1], p_d1_abs_sd, width = 12, height = 6, units = "in", device = "svg")
+ggsave(d1_sd_out[2], p_d1_abs_sd, width = 12, height = 6, units = "in", dpi = 300, device = "png")
+ggsave(d1_sd_out[3], p_d1_pct_sd, width = 12, height = 6, units = "in", device = "svg")
+ggsave(d1_sd_out[4], p_d1_pct_sd, width = 12, height = 6, units = "in", dpi = 300, device = "png")
+
+for (i in seq_along(d1_sd_out)) {
+  cat("\u2713 Plot saved:", d1_sd_files[i], "\n")
+}
+```
+## D1 Swelling by Centre: Combined (Mean +/- 1 SD, 3 Centres)
+```{r d1-sd-combined, fig.width=10, fig.height=6}
+p_d1_abs_combined <- ggplot(d1_centre_summary,
+                             aes(x = Fraction, color = Centre, fill = Centre)) +
+  geom_ribbon(aes(ymin = mean_abs - sd_abs, ymax = mean_abs + sd_abs),
+              alpha = 0.2, color = NA) +
+  geom_line(aes(y = mean_abs), linewidth = 0.9) +
+  geom_point(aes(y = mean_abs), size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  scale_x_continuous(breaks = 1:5) +
+  labs(
+    title = "Dest 1: Mean Absolute Volume Change from Fraction 1 by Centre (+/- 1 SD)",
+    x = "Fraction Number",
+    y = "Absolute Volume Change (cm3)",
+    color = "Centre", fill = "Centre"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title      = element_text(size = 12, face = "bold"),
+    legend.position = "bottom"
+  )
+
+p_d1_pct_combined <- ggplot(d1_centre_summary,
+                              aes(x = Fraction, color = Centre, fill = Centre)) +
+  geom_ribbon(aes(ymin = mean_pct - sd_pct, ymax = mean_pct + sd_pct),
+              alpha = 0.2, color = NA) +
+  geom_line(aes(y = mean_pct), linewidth = 0.9) +
+  geom_point(aes(y = mean_pct), size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  scale_x_continuous(breaks = 1:5) +
+  labs(
+    title = "Dest 1: Mean % Change from Fraction 1 by Centre (+/- 1 SD)",
+    x = "Fraction Number",
+    y = "% Change from Fraction 1",
+    color = "Centre", fill = "Centre"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title      = element_text(size = 12, face = "bold"),
+    legend.position = "bottom"
+  )
+
+print(p_d1_abs_combined)
+print(p_d1_pct_combined)
+
+ggsave(
+  filename = "D1_abs_change_combined_sd_combined.svg",
+  path = output_dir,
+  plot = p_d1_abs_combined,
+  width = 10, height = 6, units = "in", device = "svg"
+)
+cat("\u2713 Plot saved: D1_abs_change_combined_sd_combined.svg\n")
+
+ggsave(
+  filename = "D1_abs_change_combined_sd_300dpi_combined.png",
+  path = output_dir,
+  plot = p_d1_abs_combined,
+  width = 10, height = 6, units = "in", dpi = 300, device = "png"
+)
+cat("\u2713 Plot saved: D1_abs_change_combined_sd_300dpi_combined.png\n")
+
+ggsave(
+  filename = "D1_pct_change_combined_sd_combined.svg",
+  path = output_dir,
+  plot = p_d1_pct_combined,
+  width = 10, height = 6, units = "in", device = "svg"
+)
+cat("\u2713 Plot saved: D1_pct_change_combined_sd_combined.svg\n")
+
+ggsave(
+  filename = "D1_pct_change_combined_sd_combined.png",
+  path = output_dir,
+  plot = p_d1_pct_combined,
+  width = 10, height = 6, units = "in", dpi = 300, device = "png"
+)
+cat("\u2713 Plot saved: D1_pct_change_combined_sd_combined.png\n")
+```
+## MOMENTUM Swelling; All Centres Combined
+```{r momentum-data-prep, include=FALSE}
+library(ggplot2)
+library(tidyverse)
+
+mom_outlier_excluded_id <- "<patient_id_1>"
+mom_outlier_fx2_id      <- "<patient_id_2>"
+
+momentum_combined <- momentum_combined |>
+  filter(!(Patient_Id == mom_outlier_fx2_id & Fraction == 2))
+
+momentum_volume_data <- momentum_combined |>
+  filter(!is.na(Volume), Fraction <= 5, Patient_Id != mom_outlier_excluded_id) |>
+  select(Patient_Id, Fraction, Volume) |>
+  mutate(Fraction = as.numeric(Fraction))
+
+momentum_pct_data <- momentum_combined |>
+  filter(!is.na(Volume), Fraction <= 5, Patient_Id != mom_outlier_excluded_id) |>
+  select(Patient_Id, Fraction, Volume) |>
+  mutate(Fraction = as.numeric(Fraction)) |>
+  group_by(Patient_Id) |>
+  mutate(
+    fx1_vol = first(Volume[Fraction == 1]),
+    pct_change = round((Volume - fx1_vol) / fx1_vol * 100, 1)
+  ) |>
+  ungroup()
+```
+### Line Charts: Absolute and Percentage Volume Change by Centre (Mean +/- 1 SD)
+```{r momentum-line-centre, fig.width=14, fig.height=9}
+# Patient-level changes
+mom_patient_changes <- momentum_combined |>
+  filter(!is.na(Volume), Fraction <= 5, Patient_Id != mom_outlier_excluded_id) |>
+  select(Patient_Id, Institution, Fraction, Volume) |>
+  mutate(Fraction = as.numeric(Fraction)) |>
+  group_by(Patient_Id, Institution) |>
+  mutate(
+    fx1_vol    = first(Volume[Fraction == 1]),
+    abs_change = Volume - fx1_vol,
+    pct_change = (Volume - fx1_vol) / fx1_vol * 100
+  ) |>
+  ungroup()
+
+centre_n <- mom_patient_changes |>
+  distinct(Institution, Patient_Id) |>
+  count(Institution) |>
+  mutate(centre_label = paste0(Institution, "\n(n=", n, ")"))
+
+centres_to_keep <- centre_n |>
+  filter(n > 10) |>
+  pull(Institution)
+
+mom_patient_changes_filtered <- mom_patient_changes |>
+  filter(Institution %in% centres_to_keep)
+
+centre_n <- centre_n |>
+  filter(Institution %in% centres_to_keep)
+
+mom_centre_summary <- mom_patient_changes_filtered |>
+  group_by(Institution, Fraction) |>
+  summarise(
+    mean_abs = mean(abs_change, na.rm = TRUE),
+    sd_abs   = sd(abs_change, na.rm = TRUE),
+    mean_pct = mean(pct_change, na.rm = TRUE),
+    sd_pct   = sd(pct_change, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  left_join(centre_n, by = "Institution")
+
+p_mom_abs_line <- ggplot(mom_centre_summary, aes(x = Fraction)) +
+  geom_ribbon(aes(ymin = mean_abs - sd_abs, ymax = mean_abs + sd_abs),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = mean_abs), color = "steelblue", linewidth = 0.9) +
+  geom_point(aes(y = mean_abs), color = "steelblue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ centre_label, scales = "free_y") +
+  scale_x_continuous(breaks = 1:7) +
+  labs(
+    title = "MOMENTUM: Mean Absolute Volume Change from Fraction 1 by Centre (+/- 1 SD)",
+    x = "Fraction Number",
+    y = "Absolute Volume Change (cc)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 8, face = "bold")
+  )
+
+p_mom_pct_line <- ggplot(mom_centre_summary, aes(x = Fraction)) +
+  geom_ribbon(aes(ymin = mean_pct - sd_pct, ymax = mean_pct + sd_pct),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = mean_pct), color = "steelblue", linewidth = 0.9) +
+  geom_point(aes(y = mean_pct), color = "steelblue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ centre_label, scales = "free_y") +
+  scale_x_continuous(breaks = 1:7) +
+  labs(
+    title = "MOMENTUM: Mean % Change from Fraction 1 by Centre (+/- 1 SD)",
+    x = "Fraction Number",
+    y = "% Change from Fraction 1"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 8, face = "bold")
+  )
+
+print(p_mom_abs_line)
+print(p_mom_pct_line)
+
+mom_line_plots_dir <- file.path(output_dir, "plots")
+mom_line_files <- c(
+  "MOMENTUM_abs_change_by_centre_line.svg",
+  "MOMENTUM_abs_change_by_centre_line.png",
+  "MOMENTUM_pct_change_by_centre_line.svg",
+  "MOMENTUM_pct_change_by_centre_line.png"
+)
+mom_line_out <- file.path(mom_line_plots_dir, mom_line_files)
+
+ggsave(mom_line_out[1], p_mom_abs_line, width = 14, height = 9, units = "in", device = "svg")
+ggsave(mom_line_out[2], p_mom_abs_line, width = 14, height = 9, units = "in", dpi = 300, device = "png")
+ggsave(mom_line_out[3], p_mom_pct_line, width = 14, height = 9, units = "in", device = "svg")
+ggsave(mom_line_out[4], p_mom_pct_line, width = 14, height = 9, units = "in", dpi = 300, device = "png")
+
+for (i in seq_along(mom_line_out)) {
+  cat("\u2713 Plot saved:", mom_line_files[i], "\n")
+}
+```
+## Fixed Y-Axis Comparison: D1 and MOMENTUM (Same Scale Across Both Datasets)
+```{r fixed-scale-comparison, fig.width=14, fig.height=9}
+abs_all <- c(
+  d1_centre_summary$mean_abs  - d1_centre_summary$sd_abs,
+  d1_centre_summary$mean_abs  + d1_centre_summary$sd_abs,
+  mom_centre_summary$mean_abs - mom_centre_summary$sd_abs,
+  mom_centre_summary$mean_abs + mom_centre_summary$sd_abs
+)
+pct_all <- c(
+  d1_centre_summary$mean_pct  - d1_centre_summary$sd_pct,
+  d1_centre_summary$mean_pct  + d1_centre_summary$sd_pct,
+  mom_centre_summary$mean_pct - mom_centre_summary$sd_pct,
+  mom_centre_summary$mean_pct + mom_centre_summary$sd_pct
+)
+
+abs_ylim <- range(abs_all, na.rm = TRUE)
+pct_ylim <- range(pct_all, na.rm = TRUE)
+
+p_d1_abs_sd_fixed <- ggplot(d1_centre_summary, aes(x = Fraction)) +
+  geom_ribbon(aes(ymin = mean_abs - sd_abs, ymax = mean_abs + sd_abs),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = mean_abs), color = "steelblue", linewidth = 0.9) +
+  geom_point(aes(y = mean_abs), color = "steelblue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ centre_label, nrow = 1) +
+  scale_x_continuous(breaks = 1:5) +
+  coord_cartesian(ylim = abs_ylim) +
+  labs(
+    title = "Dest 1: Mean Absolute Volume Change from Fraction 1 by Centre (\u00b1 1 SD), Fixed Scale",
+    x = "Fraction Number",
+    y = "Absolute Volume Change (cm3)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+
+p_d1_pct_sd_fixed <- ggplot(d1_centre_summary, aes(x = Fraction)) +
+  geom_ribbon(aes(ymin = mean_pct - sd_pct, ymax = mean_pct + sd_pct),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = mean_pct), color = "steelblue", linewidth = 0.9) +
+  geom_point(aes(y = mean_pct), color = "steelblue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ centre_label, nrow = 1) +
+  scale_x_continuous(breaks = 1:7) +
+  coord_cartesian(ylim = pct_ylim) +
+  labs(
+    title = "Dest 1: Mean % Change from Fraction 1 by Centre (\u00b1 1 SD), Fixed Scale",
+    x = "Fraction Number",
+    y = "% Change from Fraction 1"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+
+p_mom_abs_line_fixed <- ggplot(mom_centre_summary, aes(x = Fraction)) +
+  geom_ribbon(aes(ymin = mean_abs - sd_abs, ymax = mean_abs + sd_abs),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = mean_abs), color = "steelblue", linewidth = 0.9) +
+  geom_point(aes(y = mean_abs), color = "steelblue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ centre_label) +
+  scale_x_continuous(breaks = 1:7) +
+  coord_cartesian(ylim = abs_ylim) +
+  labs(
+    title = "MOMENTUM: Mean Absolute Volume Change from Fraction 1 by Centre (\u00b1 1 SD), Fixed Scale",
+    x = "Fraction Number",
+    y = "Absolute Volume Change (cc)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 8, face = "bold")
+  )
+
+p_mom_pct_line_fixed <- ggplot(mom_centre_summary, aes(x = Fraction)) +
+  geom_ribbon(aes(ymin = mean_pct - sd_pct, ymax = mean_pct + sd_pct),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = mean_pct), color = "steelblue", linewidth = 0.9) +
+  geom_point(aes(y = mean_pct), color = "steelblue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ centre_label) +
+  scale_x_continuous(breaks = 1:7) +
+  coord_cartesian(ylim = pct_ylim) +
+  labs(
+    title = "MOMENTUM: Mean % Change from Fraction 1 by Centre (\u00b1 1 SD), Fixed Scale",
+    x = "Fraction Number",
+    y = "% Change from Fraction 1"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 8, face = "bold")
+  )
+
+print(p_d1_abs_sd_fixed)
+print(p_d1_pct_sd_fixed)
+print(p_mom_abs_line_fixed)
+print(p_mom_pct_line_fixed)
+
+ggsave(
+  filename = "D1_abs_change_by_centre_sd_fixedscale.svg",
+  path = output_dir,
+  plot = p_d1_abs_sd_fixed,
+  width = 12, height = 6, units = "in", device = "svg"
+)
+cat("\u2713 Plot saved: D1_abs_change_by_centre_sd_fixedscale.svg\n")
+
+ggsave(
+  filename = "D1_abs_change_by_centre_sd_fixedscale.png",
+  path = output_dir,
+  plot = p_d1_abs_sd_fixed,
+  width = 12, height = 6, units = "in", dpi = 300, device = "png"
+)
+cat("\u2713 Plot saved: D1_abs_change_by_centre_sd_fixedscale.png\n")
+
+ggsave(
+  filename = "D1_pct_change_by_centre_sd_fixedscale.svg",
+  path = output_dir,
+  plot = p_d1_pct_sd_fixed,
+  width = 12, height = 6, units = "in", device = "svg"
+)
+cat("\u2713 Plot saved: D1_pct_change_by_centre_sd_fixedscale.svg\n")
+
+ggsave(
+  filename = "D1_pct_change_by_centre_sd_fixedscale.png",
+  path = output_dir,
+  plot = p_d1_pct_sd_fixed,
+  width = 12, height = 6, units = "in", dpi = 300, device = "png"
+)
+cat("\u2713 Plot saved: D1_pct_change_by_centre_sd_fixedscale.png\n")
+
+ggsave(
+  filename = "MOMENTUM_abs_change_by_centre_line_fixedscale.svg",
+  path = output_dir,
+  plot = p_mom_abs_line_fixed,
+  width = 14, height = 9, units = "in", device = "svg"
+)
+cat("\u2713 Plot saved: MOMENTUM_abs_change_by_centre_line_fixedscale.svg\n")
+
+ggsave(
+  filename = "MOMENTUM_abs_change_by_centre_line_fixedscale.png",
+  path = output_dir,
+  plot = p_mom_abs_line_fixed,
+  width = 14, height = 9, units = "in", dpi = 300, device = "png"
+)
+cat("\u2713 Plot saved: MOMENTUM_abs_change_by_centre_line_fixedscale.png\n")
+
+ggsave(
+  filename = "MOMENTUM_pct_change_by_centre_line_fixedscale.svg",
+  path = output_dir,
+  plot = p_mom_pct_line_fixed,
+  width = 14, height = 9, units = "in", device = "svg"
+)
+cat("\u2713 Plot saved: MOMENTUM_pct_change_by_centre_line_fixedscale.svg\n")
+
+ggsave(
+  filename = "MOMENTUM_pct_change_by_centre_line_fixedscale.png",
+  path = output_dir,
+  plot = p_mom_pct_line_fixed,
+  width = 14, height = 9, units = "in", dpi = 300, device = "png"
+)
+cat("\u2713 Plot saved: MOMENTUM_pct_change_by_centre_line_fixedscale.png\n")
+```
+### Absolute Volume Change by Centre
+```{r momentum-abs-change-centre, fig.width=12, fig.height=8}
+abs_change_data <- momentum_combined |>
+  filter(!is.na(Volume), Fraction <= 5, Patient_Id != mom_outlier_excluded_id) |>
+  select(Patient_Id, Institution, Fraction, Volume) |>
+  mutate(Fraction = as.numeric(Fraction)) |>
+  group_by(Patient_Id) |>
+  mutate(
+    fx1_vol = first(Volume[Fraction == 1]),
+    abs_change = Volume - fx1_vol
+  ) |>
+  ungroup()
+
+p_mom_abs_boxplot <- ggplot(abs_change_data, aes(x = factor(Fraction), y = abs_change)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7, outlier.size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  facet_wrap(~ Institution, scales = "free_y") +
+  labs(
+    title = "MOMENTUM: Absolute Volume Change from Fraction 1 by Centre",
+    x = "Fraction Number",
+    y = "Absolute Volume Change (cc)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 8)
+  )
+
+print(p_mom_abs_boxplot)
+
+ggsave(
+  filename = "MOMENTUM_abs_change_boxplot_by_centre.svg",
+  path = output_dir,
+  plot = p_mom_abs_boxplot,
+  width = 12, height = 8, units = "in", device = "svg"
+)
+cat("\u2713 Plot saved: MOMENTUM_abs_change_boxplot_by_centre.svg\n")
+
+ggsave(
+  filename = "MOMENTUM_abs_change_boxplot_by_centre.png",
+  path = output_dir,
+  plot = p_mom_abs_boxplot,
+  width = 12, height = 8, units = "in", dpi = 300, device = "png"
+)
+cat("\u2713 Plot saved: MOMENTUM_abs_change_boxplot_by_centre.png\n")
+```
+### Density Plot
+### Boxplot with Jitter
+```{r momentum-boxplot, fig.width=10, fig.height=6}
+ggplot(momentum_pct_data, aes(x = factor(Fraction), y = pct_change)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.1, size = 1, color = "steelblue") +
+  labs(
+    title = "MOMENTUM: % Change from Fraction 1 (Boxplot with Individual Points)",
+    x = "Fraction Number",
+    y = "% Change from Fraction 1"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+```
+### Mean +/- IQR
+```{r momentum-mean-iqr, fig.width=10, fig.height=6}
+# Calculate summary statistics
+summary_stats <- momentum_pct_data |>
+  group_by(Fraction) |>
+  summarise(
+    Mean = round(mean(pct_change, na.rm = TRUE), 1),
+    Median = round(median(pct_change, na.rm = TRUE), 1),
+    SD = round(sd(pct_change, na.rm = TRUE), 1),
+    Q1 = round(quantile(pct_change, 0.25, na.rm = TRUE), 1),
+    Q3 = round(quantile(pct_change, 0.75, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+ggplot(summary_stats, aes(x = Fraction, y = Mean)) +
+  geom_ribbon(aes(ymin = Q1, ymax = Q3), alpha = 0.3, fill = "steelblue") +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_x_continuous(breaks = 1:7) +
+  labs(
+    title = "MOMENTUM: Mean % Change from Fraction 1 with IQR Band",
+    x = "Fraction Number",
+    y = "% Change from Fraction 1"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+```
+```{r median-iqr-flextable, echo=FALSE, message=FALSE}
+
+library(flextable)
+
+d1_summary <- d1_changes |>
+  filter(!is.na(Volume)) |>
+  group_by(Fraction) |>
+  summarise(
+    d1_median = median(Volume),
+    d1_q1     = quantile(Volume, 0.25),
+    d1_q3     = quantile(Volume, 0.75),
+    d1_n      = n(),
+    .groups = "drop"
+  ) |>
+  mutate(
+    `D1 (n)`          = paste0(d1_n),
+    `D1 Median (IQR) cm3` = paste0(
+      round(d1_median, 1), " (", round(d1_q1, 1), " to ", round(d1_q3, 1), ")"
+    )
+  )
+
+mom_summary <- mom_patient_changes |>
+  filter(!is.na(Volume)) |>
+  group_by(Fraction) |>
+  summarise(
+    mom_median = median(Volume),
+    mom_q1     = quantile(Volume, 0.25),
+    mom_q3     = quantile(Volume, 0.75),
+    mom_n      = n(),
+    .groups = "drop"
+  ) |>
+  mutate(
+    `MOMENTUM (n)`          = paste0(mom_n),
+    `MOMENTUM Median (IQR) cm3` = paste0(
+      round(mom_median, 1), " (", round(mom_q1, 1), " to ", round(mom_q3, 1), ")"
+    )
+  )
+
+# Combine
+summary_table <- d1_summary |>
+  full_join(mom_summary, by = "Fraction") |>
+  arrange(Fraction) |>
+  select(
+    Fraction,
+    `D1 (n)`,
+    `D1 Median (IQR) cm3`,
+    `MOMENTUM (n)`,
+    `MOMENTUM Median (IQR) cm3`
+  )
+
+# Build flextable
+ft_median_iqr_abs <- flextable(summary_table) |>
+  set_header_labels(Fraction = "Fraction") |>
+  add_header_row(
+    values = c("", "Dest 1 (3 centres combined)", "MOMENTUM (cleaned)"),
+    colwidths = c(1, 2, 2)
+  ) |>
+  theme_booktabs() |>
+  align(align = "center", part = "all") |>
+  align(j = 1, align = "center", part = "all") |>
+  bold(part = "header") |>
+  set_caption("Median absolute prostate volume (cm3) with IQR, by fraction") |>
+  autofit()
+
+ft_median_iqr_abs
+
+# Save as standalone Word document
+save_docx(
+  ft_median_iqr_abs,
+  path = file.path(output_dir, "median_iqr_abs_volume_table.docx")
+)
+cat("\u2713 Flextable saved: median_iqr_abs_volume_change.docx\n")
+
+```
+### Categorical Heatmap
+```{r momentum-heatmap, fig.width=10, fig.height=6}
+# Bin changes into clinical categories
+momentum_pct_binned <- momentum_pct_data |>
+  mutate(
+    change_category = cut(pct_change, 
+                          breaks = c(-Inf, -10, 0, 10, 20, Inf),
+                          labels = c("< -10%", "-10% to 0%", "0% to 10%", "10% to 20%", "> 20%"))
+  ) |>
+  group_by(Fraction, change_category) |>
+  summarise(n = n(), .groups = "drop") |>
+  mutate(pct = round(100 * n / sum(n), 1), .by = Fraction)
+
+ggplot(momentum_pct_binned, aes(x = factor(Fraction), y = change_category, fill = pct)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = paste0(pct, "%")), color = "white", fontface = "bold", size = 4) +
+  scale_fill_gradient(low = "steelblue", high = "darkblue") +
+  labs(
+    title = "MOMENTUM: Distribution of % Change Categories by Fraction",
+    x = "Fraction Number",
+    y = "% Change Category",
+    fill = "Percentage"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    panel.grid = element_blank()
+  )
+```
+### Spaghetti Plot with Summary Lines
+```{r momentum-spaghetti, fig.width=12, fig.height=6}
+p_spaghetti <- ggplot(momentum_pct_data, aes(x = Fraction, y = pct_change, group = Patient_Id)) +
+  geom_line(alpha = 0.08, linewidth = 0.3, color = "steelblue") +
+  stat_summary(aes(group = NA), fun = median, geom = "line", color = "red", linewidth = 1.5, 
+               linetype = "solid") +
+  stat_summary(aes(group = NA), fun = mean, geom = "line", color = "orange", linewidth = 1.5,
+               linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "gray50", linewidth = 0.5) +
+  scale_x_continuous(breaks = 1:7) +
+  labs(
+    title = "MOMENTUM: Individual Trajectories with Mean (orange dashed) and Median (red solid)",
+    x = "Fraction Number",
+    y = "% Change from Fraction 1",
+    caption = sprintf("Each light line = one patient trajectory (n=%s patients)",
+                       format(n_distinct(momentum_pct_data$Patient_Id), big.mark = ","))
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    plot.caption = element_text(size = 10, face = "italic")
+  )
+
+print(p_spaghetti)
+```
+## Swelling Metrics Table + Spaghetti Plot
+```{r swelling-summary-output, fig.width=12, fig.height=6}
+library(flextable)
+
+delta <- "\u0394"; ge <- "\u2265"; en <- "\u2013"
+
+# Swelling comparison flextable
+swelling_ft_data <- bind_rows(
+  mom_swelling |> mutate(cohort = "MOMENTUM"),
+  d1_swelling  |> dplyr::rename(Patient_Id = patient_uid) |> mutate(cohort = "D1")
+) |>
+  dplyr::group_by(cohort) |>
+  dplyr::summarise(
+    n               = as.character(n()),
+    med_peak        = as.character(round(median(peak_dr_mm, na.rm = TRUE), 2)),
+    iqr_peak        = paste0(round(quantile(peak_dr_mm, 0.25, na.rm = TRUE), 2), en,
+                             round(quantile(peak_dr_mm, 0.75, na.rm = TRUE), 2)),
+    pct_ge3         = as.character(round(mean(peak_dr_mm >= 3, na.rm = TRUE) * 100, 1)),
+    pct_ge1         = as.character(round(mean(peak_dr_mm >= 1, na.rm = TRUE) * 100, 1)),
+    med_burden3     = as.character(median(burden_3mm, na.rm = TRUE)),
+    med_mean_first5 = as.character(round(median(mean_dr_first5, na.rm = TRUE), 2)),
+    .groups = "drop"
+  ) |>
+  tidyr::pivot_longer(-cohort, names_to = "key", values_to = "val") |>
+  tidyr::pivot_wider(names_from = cohort, values_from = val) |>
+  dplyr::mutate(Metric = dplyr::case_match(key,
+    "n"               ~ "n (patients)",
+    "med_peak"        ~ paste0("Median peak ", delta, "r (mm)"),
+    "iqr_peak"        ~ paste0("IQR peak ", delta, "r (mm)"),
+    "pct_ge3"         ~ paste0("% with peak ", delta, "r ", ge, " 3 mm"),
+    "pct_ge1"         ~ paste0("% with peak ", delta, "r ", ge, " 1 mm"),
+    "med_burden3"     ~ paste0("Median burden (fractions ", ge, " 3 mm)"),
+    "med_mean_first5" ~ paste0("Median mean ", delta, "r, fractions 1", en, "5 (mm)")
+  )) |>
+  dplyr::select(Metric, D1, MOMENTUM)
+
+ft_swelling_summary <- flextable(swelling_ft_data) |>
+  set_header_labels(Metric   = "Swelling Metric",
+                    D1       = "Dest 1 (CentreA+CentreC)\n(n=40)",
+                    MOMENTUM = sprintf("MOMENTUM\n(n=%s)",
+                                        format(n_distinct(mom_swelling$Patient_Id), big.mark = ","))) |>
+  bg(i = seq(2, nrow(swelling_ft_data), 2), bg = "#DEEAF1", part = "body") |>
+  bold(part = "header") |>
+  bg(part = "header", bg = "#1F4E79") |>
+  color(part = "header", color = "white") |>
+  bg(i = seq(2, nrow(swelling_ft_data), 2), bg = "#DEEAF1", part = "body") |>
+  align(j = 2:3, align = "center", part = "all") |>
+  autofit()
+
+ft_swelling_summary
+```
+## SAP Analysis
+### Build d1_model (SAP Section 5.1)
+```{r sap-d1-model-build}
+library(tidyverse)
+library(flextable)
+library(officer)
+
+d1_model <- d1 |>
+  filter(Centre %in% c("centreC", "centreA")) |>
+  inner_join(
+    d1_swelling |> select(id, Centre, baseline_vol_cm3, peak_dr_mm, burden_3mm, burden_1mm),
+    by = c("id", "Centre")
+  ) |>
+  mutate(
+    GU_G2_12w = as.integer(gu_ge2_by_wk12),
+    ADT       = if_else(adt == "Y", 1L, 0L),
+    centre    = factor(Centre, levels = c("centreC", "centreA"))
+  ) |>
+  select(
+    id, centre, GU_G2_12w, baseline_vol_cm3,
+    ADT, IPSS_baseline = baseline_ipss_tot, age,
+    peak_dr_mm, burden_3mm, burden_1mm
+  ) |>
+  # Unique character ID across centres
+  mutate(id = paste0(centre, "_", id))
+
+str(d1_model)
+```
+### SAP Step 2: Pre-processing (SAP Section 5.3)
+```{r sap-preprocessing}
+d1_model <- d1_model |>
+  mutate(
+    baseline_vol_c = baseline_vol_cm3 - median(baseline_vol_cm3, na.rm = TRUE),
+    IPSS_c         = IPSS_baseline    - median(IPSS_baseline,    na.rm = TRUE),
+    age_c          = age              - median(age,              na.rm = TRUE),
+    ADT_factor     = factor(ADT, levels = c(0, 1), labels = c("No", "Yes")),
+    centre_factor  = factor(centre)
+  )
+
+cat("Medians used for centring:\n")
+cat("  baseline_vol_cm3:", median(d1_model$baseline_vol_cm3), "cm3\n")
+cat("  IPSS_baseline:   ", median(d1_model$IPSS_baseline), "\n")
+cat("  age:             ", median(d1_model$age), "years\n")
+```
+### SAP Step 3: Pre-modelling checks (SAP Section 5.4, 5.7)
+```{r sap-premodelling-checks}
+# Events and EPV
+cat("Outcome counts:\n")
+print(table(d1_model$GU_G2_12w))
+
+n_events         <- sum(d1_model$GU_G2_12w == 1, na.rm = TRUE)
+n_params_primary <- 1 + 1
+EPV              <- n_events / n_params_primary
+cat("\nEvents:", n_events, "| Parameters:", n_params_primary, "| EPV:", round(EPV, 1), "\n")
+cat("(Original 4-param model EPV:", round(n_events / 4, 1), "-- below conventional threshold of 10)\n")
+
+# Separation check (SAP Section 5.4)
+cat("\nSeparation check - burden_3mm vs GU_G2_12w:\n")
+cat("NOTE: burden_3mm = 0 for all", nrow(d1_model), "patients -- zero variance; Model A dropped.\n")
+
+cat("\nSeparation check - burden_1mm vs GU_G2_12w:\n")
+print(with(d1_model, table(burden_1mm, GU_G2_12w)))
+```
+### SAP Section 6.1: D1 Descriptives
+#### Table 1: Baseline characteristics; D1 and MOMENTUM combined
+```{r sap-combined-baseline}
+med_iqr <- function(x) {
+  x <- as.numeric(x); x <- x[!is.na(x)]
+  if (length(x) == 0) return("N/A \u2021")
+  sprintf("%.1f (%.1f\u2013%.1f)", median(x), quantile(x, 0.25), quantile(x, 0.75))
+}
+
+adt_fmt <- function(x) {
+  x <- x[!is.na(x) & x != "NA"]
+  if (length(x) == 0) return("N/A \u2021")
+  yes <- sum(x %in% c("Y", "Yes"), na.rm = TRUE)
+  sprintf("%d/%d (%.0f%%)", yes, length(x), 100 * yes / length(x))
+}
+
+gu_fmt <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return("N/A \u2021")
+  sprintf("%d/%d (%.0f%%)", sum(x, na.rm = TRUE), length(x), 100 * mean(x, na.rm = TRUE))
+}
+
+# D1 subsets
+d1_centreC <- d1 |> filter(Centre == "centreC")
+d1_centreA <- d1 |> filter(Centre == "centreA")
+d1_centreB <- d1 |> filter(Centre == "centreB")
+
+# MOMENTUM patient-level data
+mom_pts_tbl <- momentum_combined |>
+  filter(Cohort == "MOM") |>
+  distinct(Patient_Id, .keep_all = TRUE) |>
+  mutate(adt_use_clean = case_when(
+    ADT_Use %in% c("Yes", "Y") ~ "Yes",
+    ADT_Use %in% c("No",  "N") ~ "No",
+    TRUE ~ NA_character_
+  ))
+
+mom_vol <- mom_swelling |> pull(baseline_vol_cm3)
+
+t_known <- mom_pts_tbl |>
+  filter(!is.na(T_STAGE_GROUP), !T_STAGE_GROUP %in% c("Other", "Tx"))
+t_fmt <- function(stage) {
+  n <- sum(t_known$T_STAGE_GROUP == stage, na.rm = TRUE)
+  sprintf("%d/%d (%.0f%%)", n, nrow(t_known), 100 * n / nrow(t_known))
+}
+
+gg_known <- mom_pts_tbl |>
+  filter(!is.na(PRE_C61_GLEASON_SCORE_PRIMARY), !is.na(PRE_C61_GLEASON_SCORE_SECONDARY)) |>
+  mutate(
+    gleason_primary   = as.numeric(PRE_C61_GLEASON_SCORE_PRIMARY),
+    gleason_secondary = as.numeric(PRE_C61_GLEASON_SCORE_SECONDARY),
+    gleason_total      = gleason_primary + gleason_secondary,
+    grade_group = case_when(
+      gleason_primary <= 3 & gleason_secondary <= 3 ~ "GG1",
+      gleason_primary == 3 & gleason_secondary == 4 ~ "GG2",
+      gleason_primary == 4 & gleason_secondary == 3 ~ "GG3",
+      gleason_total == 8                             ~ "GG4",
+      gleason_total >= 9                             ~ "GG5",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  filter(!is.na(grade_group))
+gg_fmt <- function(gg) {
+  n <- sum(gg_known$grade_group == gg, na.rm = TRUE)
+  sprintf("%s: %d/%d (%.0f%%)", gg, n, nrow(gg_known), 100 * n / nrow(gg_known))
+}
+gg_groups_present <- sort(unique(gg_known$grade_group))
+gg_mom_str <- paste(sapply(gg_groups_present, gg_fmt), collapse = " | ")
+
+tbl_combined <- bind_rows(list(
+
+  tibble(Variable = "n",
+    CentreC        = "20",
+    CentreA = "20",
+    CentreB        = "20",
+    MOMENTUM   = format(n_distinct(mom_pts_tbl$Patient_Id), big.mark = ",")),
+
+  tibble(Variable = "Age, years: median (IQR)",
+    CentreC        = med_iqr(d1_centreC$age),
+    CentreA = med_iqr(d1_centreA$age),
+    CentreB        = "69 (64\u201372)",
+    MOMENTUM   = med_iqr(mom_pts_tbl$AGE_DIAGNOSIS)),
+
+  tibble(Variable = "Baseline prostate CTV volume (Fx1 scan), cm3: median (IQR)",
+    CentreC        = med_iqr(d1_centreC$fx1_ctv_vol),
+    CentreA = med_iqr(d1_centreA$fx1_ctv_vol),
+    CentreB        = med_iqr(d1_centreB$fx1_ctv_vol),
+    MOMENTUM   = med_iqr(mom_vol)),
+
+  tibble(Variable = "Baseline PSA, ng/mL: median (IQR)",
+    CentreC        = med_iqr(d1_centreC$baseline_psa),
+    CentreA = med_iqr(d1_centreA$baseline_psa),
+    CentreB        = "N/A \u2021",
+    MOMENTUM   = med_iqr(suppressWarnings(as.numeric(mom_pts_tbl$PRE_C61_PSA)))),
+
+  tibble(Variable = "Gleason Grade Group: n/N (%)",
+    CentreC        = "GG1: 2/20 (10%) | GG2: 17/20 (85%) | GG3: 1/20 (5%)",
+    CentreA = "GG1: 0/20 (0%) | GG2: 17/20 (85%) | GG3: 3/20 (15%)",
+    CentreB        = "GG1: 1/20 (5%) | GG2: 12/20 (60%) | GG3: 7/20 (35%)",
+    MOMENTUM   = gg_mom_str),
+
+  tibble(Variable = "ADT use: n/N with data (%)",
+    CentreC        = adt_fmt(d1_centreC$adt),
+    CentreA = adt_fmt(d1_centreA$adt),
+    CentreB        = "4/20 (20%)",
+    MOMENTUM   = sprintf("%d/%d (%.0f%%)",
+                   sum(mom_pts_tbl$adt_use_clean == "Yes", na.rm = TRUE),
+                   sum(!is.na(mom_pts_tbl$adt_use_clean)),
+                   100 * mean(mom_pts_tbl$adt_use_clean == "Yes", na.rm = TRUE))),
+
+  tibble(Variable = "Baseline IPSS: median (IQR)",
+    CentreC        = med_iqr(d1_centreC$baseline_ipss_tot),
+    CentreA = med_iqr(d1_centreA$baseline_ipss_tot),
+    CentreB        = "3.5 (2\u20139.5)",
+    MOMENTUM   = "N/A"),
+
+  tibble(Variable = "T stage (n with data)",
+    CentreC = "20", CentreA = "20", CentreB = "20",
+    MOMENTUM = as.character(nrow(t_known))),
+  tibble(Variable = "  T1/cT1c",
+    CentreC = sprintf("%d/20 (%.0f%%)", sum(d1_centreC$t_stage=="1A"), 100*mean(d1_centreC$t_stage=="1A")),
+    CentreA = sprintf("%d/20 (%.0f%%)", sum(d1_centreA$t_stage=="T1c"), 100*mean(d1_centreA$t_stage=="T1c")),
+    CentreB = "13/20 (65%)",
+    MOMENTUM = sprintf("%d/%d (%.0f%%)", sum(t_known$T_STAGE_GROUP=="T1"), nrow(t_known), 100*sum(t_known$T_STAGE_GROUP=="T1")/nrow(t_known))),
+  tibble(Variable = "  T2/cT2a-b",
+    CentreC = sprintf("%d/20 (%.0f%%)", sum(d1_centreC$t_stage=="2"), 100*mean(d1_centreC$t_stage=="2")),
+    CentreA = sprintf("%d/20 (%.0f%%)", sum(d1_centreA$t_stage %in% c("T2a","T2b")), 100*mean(d1_centreA$t_stage %in% c("T2a","T2b"))),
+    CentreB = "7/20 (35%)",
+    MOMENTUM = sprintf("%d/%d (%.0f%%)", sum(t_known$T_STAGE_GROUP=="T2"), nrow(t_known), 100*sum(t_known$T_STAGE_GROUP=="T2")/nrow(t_known))),
+  tibble(Variable = "  T3",
+    CentreC = "0/20 (0%)",
+    CentreA = "0/20 (0%)",
+    CentreB = "0/20 (0%)",
+    MOMENTUM = sprintf("%d/%d (%.0f%%)", sum(t_known$T_STAGE_GROUP=="T3"), nrow(t_known), 100*sum(t_known$T_STAGE_GROUP=="T3")/nrow(t_known))),
+  tibble(Variable = "  T4",
+    CentreC = "0/20 (0%)",
+    CentreA = "0/20 (0%)",
+    CentreB = "0/20 (0%)",
+    MOMENTUM = sprintf("%d/%d (%.0f%%)", sum(t_known$T_STAGE_GROUP=="T4"), nrow(t_known), 100*sum(t_known$T_STAGE_GROUP=="T4")/nrow(t_known))),
+
+  tibble(Variable = "GU \u2265 Grade 2 at 12 wk: n/N (%)",
+    CentreC        = gu_fmt(d1_centreC$gu_ge2_by_wk12),
+    CentreA = gu_fmt(d1_centreA$gu_ge2_by_wk12),
+    CentreB        = "9/20 (45%) \u2020",
+    MOMENTUM   = "N/A"),
+
+  tibble(Variable = "T stage (n with data)",
+    CentreC = "N/A \u2021", CentreA = "N/A \u2021", CentreB = "N/A \u2021",
+    MOMENTUM = as.character(nrow(t_known))),
+  tibble(Variable = "  T1",
+    CentreC = "N/A \u2021", CentreA = "N/A \u2021", CentreB = "N/A \u2021",
+    MOMENTUM = t_fmt("T1")),
+  tibble(Variable = "  T2",
+    CentreC = "N/A \u2021", CentreA = "N/A \u2021", CentreB = "N/A \u2021",
+    MOMENTUM = t_fmt("T2")),
+  tibble(Variable = "  T3",
+    CentreC = "N/A \u2021", CentreA = "N/A \u2021", CentreB = "N/A \u2021",
+    MOMENTUM = t_fmt("T3")),
+  tibble(Variable = "  T4",
+    CentreC = "N/A \u2021", CentreA = "N/A \u2021", CentreB = "N/A \u2021",
+    MOMENTUM = t_fmt("T4"))
+))
+
+ft_combined_baseline <- flextable(tbl_combined) |>
+  set_header_labels(
+    Variable   = "Characteristic",
+    CentreC        = "CentreC\n(n = 20)",
+    CentreA = "CentreA\n(n = 20)",
+    CentreB        = "CentreB\n(n = 20)",
+    MOMENTUM   = sprintf("MOMENTUM\n(n = %s)", format(n_distinct(mom_pts_tbl$Patient_Id), big.mark = ","))
+  ) |>
+  bold(part = "header") |>
+  bold(i = 1, part = "body") |>
+  bg(part = "header", bg = "#1F4E79") |>
+  color(part = "header", color = "white") |>
+  bg(i = seq(2, nrow(tbl_combined), 2), bg = "#DEEAF1", part = "body") |>
+  align(j = 2:5, align = "center", part = "all") |>
+  align(j = 1, align = "left",   part = "all") |>
+  italic(i = which(grepl("^  T", tbl_combined$Variable)), j = 1, part = "body") |>
+  add_footer_lines(paste0(
+    "\u2020 CentreB GU Grade 2: aggregate institutional data (cumulative CTCAE GU >= Grade 2). ",
+    "\u2021 CentreB individual patient-level data not available (aggregate data only). ",
+    "Baseline volume: Fraction 1 on-treatment CTV scan for all cohorts (reference for swelling metrics). ",
+    sprintf("ADT data available for all 60 Dest 1 patients and %d/%s MOMENTUM patients (%.1f%%). ",
+            sum(!is.na(mom_pts_tbl$adt_use_clean)),
+            format(n_distinct(mom_pts_tbl$Patient_Id), big.mark = ","),
+            100 * sum(!is.na(mom_pts_tbl$adt_use_clean)) / n_distinct(mom_pts_tbl$Patient_Id)),
+    "ADT: androgen deprivation therapy. IPSS: International Prostate Symptom Score. IQR: interquartile range."
+  )) |>
+  set_caption("Table 1. Baseline characteristics of Dest 1 and MOMENTUM SBRT cohorts.") |>
+  autofit()
+
+ft_table1 <- ft_combined_baseline
+
+ft_combined_baseline
+```
+#### Swelling metrics by GU outcome (SAP Section 6.1)
+```{r sap-swelling-by-outcome, fig.width=5, fig.height=5}
+plot_data <- d1_model |>
+  mutate(outcome = factor(GU_G2_12w, levels = c(0,1),
+                          labels = c("No GU \u2265 G2", "GU \u2265 G2 at 12 wk"))) |>
+  select(id, outcome, peak_dr_mm) |>
+  pivot_longer(cols = c(peak_dr_mm),
+               names_to = "metric", values_to = "value") |>
+  mutate(metric = factor(metric,
+    levels = c("peak_dr_mm"),
+    labels = c("Peak \u0394r (mm)")))
+
+p_swelling_outcome <- plot_swelling_boxplot(
+  data = plot_data, aes_x = outcome, aes_y = value, aes_colour = outcome,
+  facet_var = ~metric, boxplot_width = 0.45, jitter_size = 2.2,
+  colours = c("No GU \u2265 G2" = "#4393c3", "GU \u2265 G2 at 12 wk" = "#d6604d"),
+  x_labels = c("No GU \u2265 G2" = "No GU \u2265 G2\nat 12 wk", "GU \u2265 G2 at 12 wk" = "GU \u2265 G2\nat 12 wk"),
+  title = "Swelling metrics by GU AE outcome at 12 weeks",
+  subtitle = "Dest 1 cohort (CentreC + CentreA, n = 40).\nBoxes show IQR and median.",
+  seed = 4821
+)
+
+p_swelling_outcome
+```
+#### Swelling metrics by centre (SAP Section 6.1)
+```{r sap-swelling-by-centre, fig.width=9, fig.height=5}
+d1_sw_centre <- d1_swelling |>
+  filter(Centre %in% c("centreC","centreA")) |>
+  transmute(Centre_label = as.character(factor(Centre, levels = c("centreC","centreA"),
+                                               labels = c("CentreC","CentreA"))),
+            peak_dr_mm, burden_1mm)
+
+mom_sw_centre <- mom_swelling |>
+  transmute(Centre_label = "MOMENTUM", peak_dr_mm, burden_1mm)
+
+sw_centre_long <- bind_rows(d1_sw_centre, mom_sw_centre) |>
+  mutate(Centre_label = factor(Centre_label, levels = c("CentreC","CentreA","MOMENTUM"))) |>
+  pivot_longer(c(peak_dr_mm, burden_1mm),
+               names_to = "metric", values_to = "value") |>
+  mutate(metric = factor(metric,
+    levels = c("peak_dr_mm","burden_1mm"),
+    labels = c("Peak change in radius (\u0394r)", "Burden \u2265 1 mm")))
+
+n_centreC_sw <- n_distinct(d1_swelling$id[d1_swelling$Centre == "centreC"])
+n_centreA_sw <- n_distinct(d1_swelling$id[d1_swelling$Centre == "centreA"])
+n_mom_sw <- n_distinct(mom_swelling$Patient_Id)
+
+if (!requireNamespace("patchwork", quietly = TRUE)) install.packages("patchwork")
+library(patchwork)
+
+make_sw_panel <- function(dat, ylab) {
+  ggplot(dat, aes(x = Centre_label, y = value)) +
+    geom_boxplot(outlier.shape = NA, width = 0.4, colour = "grey50", fill = NA) +
+    geom_jitter(aes(colour = Centre_label), width = 0.13, height = 0,
+                size = 1.6, alpha = 0.5) +
+    facet_wrap(~metric) +
+    scale_colour_manual(values = c("CentreC" = "#E69F00", "CentreA" = "#56B4E9",
+                                   "MOMENTUM" = "#009E73")) +
+    scale_y_continuous(breaks = scales::breaks_width(1), limits = c(0, 6.3)) +
+    labs(x = NULL, y = ylab) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "#1F4E79"),
+          strip.text = element_text(colour = "white", face = "bold"),
+          panel.grid.major.x = element_blank())
+}
+
+set.seed(2847)
+p_sw_peak   <- make_sw_panel(filter(sw_centre_long, metric == levels(metric)[1]), "Millimetres (mm)")
+p_sw_burden <- make_sw_panel(filter(sw_centre_long, metric == levels(metric)[2]), "Number of fractions")
+
+p_d1_sw_centre <- (p_sw_peak | p_sw_burden) +
+  plot_annotation(
+    title = "Swelling metrics by centre: Dest 1 cohort and MOMENTUM reference",
+    subtitle = sprintf("CentreC n = %d, CentreA n = %d, MOMENTUM n = %s. CentreB excluded (no per-fraction volume data).\nBoxes show IQR and median. MOMENTUM is a descriptive reference only.",
+                       n_centreC_sw, n_centreA_sw, format(n_mom_sw, big.mark = ",")),
+    theme = theme(plot.title = element_text(size = 15), plot.subtitle = element_text(size = 12))
+  )
+
+p_d1_sw_centre
+```
+#### Delta r trajectories by ADT status (SAP Section 6.1)
+```{r sap-adt-trajectories, fig.width=9, fig.height=5}
+d1_long_adt <- d1_long |>
+  left_join(d1 |> select(id, Centre, adt), by = c("id", "Centre")) |>
+  group_by(id, Centre) |>
+  mutate(
+    r_mm    = ((3 * Volume / (4 * pi))^(1/3)) * 10,
+    r_fx1   = r_mm[Fraction == 1],
+    delta_r = r_mm - r_fx1
+  ) |>
+  ungroup() |>
+  mutate(adt_label = case_when(
+    adt == "Y"  ~ "ADT: Yes",
+    adt == "N"  ~ "ADT: No",
+    is.na(adt)  ~ "ADT: Unknown"
+  ))
+
+adt_summary <- d1_long_adt |>
+  filter(adt %in% c("N","Y")) |>
+  group_by(adt_label, Fraction) |>
+  summarise(mean_dr = mean(delta_r, na.rm = TRUE), .groups = "drop")
+
+set.seed(7234)
+p_adt_traj <- ggplot(
+    d1_long_adt |> filter(adt %in% c("N","Y")),
+    aes(x = Fraction, y = delta_r, group = interaction(id, Centre))
+  ) +
+  geom_line(aes(colour = Centre), alpha = 0.35, linewidth = 0.5) +
+  geom_line(data = adt_summary,
+            aes(x = Fraction, y = mean_dr, group = adt_label),
+            colour = "black", linewidth = 1.1, inherit.aes = FALSE) +
+  geom_point(data = adt_summary,
+             aes(x = Fraction, y = mean_dr),
+             colour = "black", size = 2, inherit.aes = FALSE) +
+  facet_wrap(~ adt_label) +
+  scale_x_continuous(breaks = 1:5) +
+  scale_colour_manual(values = c(centreC = "blue", centreA = "#D55E00", centreB = "forestgreen"),
+                      labels = c(centreC = "CentreC", centreA = "CentreA", centreB = "CentreB")) +
+  labs(x = "Fraction", y = "\u0394r from Fraction 1 (mm)",
+       title = "Prostate radius change (\u0394r) by ADT status \u2014 Dest 1 cohort",
+       subtitle = "Light lines = individual patients (colour by centre). Black line = group mean.",
+       colour = "Centre") +
+  theme_bw(base_size = 12) +
+  theme(strip.background = element_rect(fill = "#1F4E79"),
+        strip.text = element_text(colour = "white", face = "bold"),
+        panel.grid.minor = element_blank())
+
+p_adt_traj
+```
+#### D1 swelling metrics by ADT status (SAP Section 6.1)
+```{r sap-d1-swelling-adt, fig.width=9, fig.height=5}
+d1_swelling_adt <- d1_swelling |>
+  left_join(d1 |> select(id, Centre, adt), by = c("id", "Centre")) |>
+  filter(adt %in% c("N","Y")) |>
+  mutate(adt_label = if_else(adt == "Y", "ADT: Yes", "ADT: No")) |>
+  select(id, Centre, adt_label, peak_dr_mm, burden_1mm)
+
+d1_sw_long <- d1_swelling_adt |>
+  pivot_longer(c(peak_dr_mm, burden_1mm),
+               names_to = "metric", values_to = "value") |>
+  mutate(metric = factor(metric,
+    levels = c("peak_dr_mm","burden_1mm"),
+    labels = c("Peak \u0394r (mm)", "Burden \u2265 1 mm\n(number of fractions)")))
+
+p_d1_adt_swelling <- plot_swelling_boxplot(
+  data = d1_sw_long, aes_x = adt_label, aes_y = value, aes_colour = Centre,
+  facet_var = ~metric,
+  colours = c(centreC = "blue", centreA = "#D55E00", centreB = "forestgreen"),
+  colour_labels = c(centreC = "CentreC", centreA = "CentreA", centreB = "CentreB"),
+  x_labels = c("ADT: No" = "ADT\nNo", "ADT: Yes" = "ADT\nYes"),
+  title = "Swelling metrics by ADT status \u2014 Dest 1 cohort",
+  subtitle = "Boxes show IQR and median",
+  legend_title = "Centre",
+  legend_pos = "bottom",
+  seed = 3912
+)
+
+p_d1_adt_swelling
+```
+### SAP Section 6.2: MOMENTUM SBRT Descriptives
+#### Baseline characteristics
+```{r sap-momentum-baseline}
+ft_mom_baseline <- ft_combined_baseline
+ft_mom_baseline
+```
+#### MOMENTUM swelling by ADT (SAP Section 6.2)
+```{r sap-momentum-swelling-adt, eval=TRUE, fig.height=5, fig.width=9, include=FALSE}
+mom_adt_lookup <- momentum_combined |>
+  distinct(Patient_Id, ADT_Use, adt) |>
+  mutate(
+    adt_combined = coalesce(ADT_Use, adt),
+    adt_binary   = case_when(
+      adt_combined %in% c("Yes","Y") ~ "ADT: Yes",
+      adt_combined %in% c("No","N")  ~ "ADT: No",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  select(Patient_Id, adt_binary)
+
+mom_swelling_adt <- mom_swelling |>
+  left_join(mom_adt_lookup, by = "Patient_Id") |>
+  filter(!is.na(adt_binary))
+
+mom_sw_long <- mom_swelling_adt |>
+  pivot_longer(c(peak_dr_mm, burden_1mm),
+               names_to = "metric", values_to = "value") |>
+  mutate(metric = factor(metric,
+    levels = c("peak_dr_mm","burden_1mm"),
+    labels = c("Peak \u0394r (mm)", "Burden \u2265 1 mm\n(fractions)")))
+
+n_mom_total_pts <- momentum_combined |>
+  filter(Cohort == "MOM") |>
+  distinct(Patient_Id) |>
+  nrow()
+n_mom_adt_yes <- sum(mom_swelling_adt$adt_binary == "ADT: Yes", na.rm = TRUE)
+n_mom_adt_no  <- sum(mom_swelling_adt$adt_binary == "ADT: No",  na.rm = TRUE)
+n_mom_adt_known <- n_mom_adt_yes + n_mom_adt_no
+pct_mom_adt_known <- round(100 * n_mom_adt_known / n_mom_total_pts)
+
+p_mom_adt_swelling <- plot_swelling_boxplot(
+  data = mom_sw_long, aes_x = adt_binary, aes_y = value,
+  facet_var = ~metric, boxplot_width = 0.45, jitter_width = 0.15, jitter_size = 0.8,
+  x_labels = c("ADT: No" = "ADT\nNo", "ADT: Yes" = "ADT\nYes"),
+  title = "Swelling metrics by ADT status \u2014 MOMENTUM SBRT cohort",
+  subtitle = sprintf(
+    "n = %d/%d patients with ADT data (%d%%). Boxes show IQR and median.\nCaution: ADT No n = %d only.",
+    n_mom_adt_known, n_mom_total_pts, pct_mom_adt_known, n_mom_adt_no
+  ),
+  seed = 5534
+)
+
+p_mom_adt_swelling
+```
+#### D1 and SBRT context swelling by ADT (SAP Section 6.2)
+```{r sap-d1-vs-sbrt-adt, fig.width=9, fig.height=7}
+d1_for_compare <- d1_swelling_adt |>
+  select(adt_label, peak_dr_mm, burden_1mm) |>
+  mutate(Cohort = "Dest 1 (CentreC + CentreA)")
+
+mom_for_compare <- mom_swelling_adt |>
+  select(adt_label = adt_binary, peak_dr_mm, burden_1mm) |>
+  mutate(Cohort = "MOMENTUM SBRT")
+
+combined_compare <- bind_rows(d1_for_compare, mom_for_compare) |>
+  pivot_longer(c(peak_dr_mm, burden_1mm),
+               names_to = "metric", values_to = "value") |>
+  mutate(
+    metric = factor(metric,
+      levels = c("peak_dr_mm","burden_1mm"),
+      labels = c("Peak change in radius (\u0394r)\n(mm)", "Burden \u2265 1 mm\n(fractions)")
+    ),
+    Cohort = factor(Cohort, levels = c("Dest 1 (CentreC + CentreA)", "MOMENTUM SBRT"))
+  )
+
+n_d1_adt_yes <- d1_for_compare |> filter(adt_label == "ADT: Yes") |> nrow()
+n_d1_adt_no  <- d1_for_compare |> filter(adt_label == "ADT: No")  |> nrow()
+n_mom_cmp_adt_yes <- mom_for_compare |> filter(adt_label == "ADT: Yes") |> nrow()
+n_mom_cmp_adt_no  <- mom_for_compare |> filter(adt_label == "ADT: No")  |> nrow()
+n_mom_cmp_total_pts <- momentum_combined |>
+  filter(Cohort == "MOM") |>
+  distinct(Patient_Id) |>
+  nrow()
+pct_mom_cmp_known <- round(100 * (n_mom_cmp_adt_yes + n_mom_cmp_adt_no) / n_mom_cmp_total_pts)
+
+set.seed(9102)
+p_compare_adt <- ggplot(combined_compare, aes(x = Cohort, y = value)) +
+  geom_boxplot(aes(fill = Cohort), outlier.shape = NA, width = 0.5, alpha = 0.4) +
+  geom_jitter(aes(colour = Cohort), width = 0.15, height = 0, size = 1.6, alpha = 0.5) +
+  facet_grid(metric ~ adt_label, scales = "free_y", switch = "y") +
+  scale_colour_manual(values = c("Dest 1 (CentreC + CentreA)" = "#d6604d",
+                                  "MOMENTUM SBRT"         = "#4393c3")) +
+  scale_fill_manual(values   = c("Dest 1 (CentreC + CentreA)" = "#d6604d",
+                                  "MOMENTUM SBRT"         = "#4393c3")) +
+  labs(x = NULL, y = NULL,
+       title = "Swelling metrics: Dest 1 vs MOMENTUM SBRT, by ADT status",
+       subtitle = sprintf(
+         "Dest 1: ADT No n=%d, ADT Yes n=%d. MOMENTUM: ADT No n=%d, ADT Yes n=%d (%d%% with ADT data).",
+         n_d1_adt_no, n_d1_adt_yes, n_mom_cmp_adt_no, n_mom_cmp_adt_yes, pct_mom_cmp_known
+       ),
+       colour = "Cohort", fill = "Cohort") +
+  theme_bw(base_size = 12) +
+  theme(strip.background = element_rect(fill = "#1F4E79"),
+        strip.text = element_text(colour = "white", face = "bold"),
+        strip.placement = "outside",
+        strip.background.y = element_blank(),
+        strip.text.y.left = element_text(colour = "black", face = "plain", angle = 90),
+        panel.grid.major.x = element_blank(),
+        legend.position = "bottom") +
+  guides(colour = guide_legend(override.aes = list(size = 2.5, alpha = 0.9)),
+         fill   = "none")
+
+p_compare_adt
+```
+#### eFile 4: MOMENTUM patients per institution
+```{r efile4-mom-centre-n}
+efile4_mom_centre_n <- momentum_combined |>
+  filter(Cohort == "MOM", !is.na(Volume)) |>
+  distinct(Patient_Id, Institution) |>
+  count(Institution, name = "n_patients") |>
+  arrange(desc(n_patients)) |>
+  mutate(percent = round(100 * n_patients / sum(n_patients), 1))
+
+efile4_mom_centre_n
+cat("Institutions:", nrow(efile4_mom_centre_n), "| Patients:", sum(efile4_mom_centre_n$n_patients), "\n")
+```
+### SAP Section 5: Primary Analysis — Standard Logistic Regression
+```{r models}
+
+# ============================================================
+# PRIMARY ANALYSIS
+# ============================================================
+
+modelC <- glm(
+  GU_G2_12w ~ peak_dr_mm + baseline_vol_c,
+  data = d1_model,
+  family = binomial(link = "logit")
+)
+
+cat("\n=== Primary model: peak Δr + baseline volume ===\n")
+summary(modelC)
+
+
+modelC_adt <- glm(
+  GU_G2_12w ~ peak_dr_mm + baseline_vol_c + ADT_factor,
+  data = d1_model,
+  family = binomial(link = "logit")
+)
+
+cat("\n=== Sensitivity model: peak Δr + baseline volume + ADT ===\n")
+summary(modelC_adt)
+
+
+modelC_ipss <- glm(
+  GU_G2_12w ~ peak_dr_mm + baseline_vol_c + IPSS_c,
+  data = d1_model,
+  family = binomial(link = "logit")
+)
+
+cat("\n=== Sensitivity model: peak Δr + baseline volume + baseline IPSS ===\n")
+summary(modelC_ipss)
+```
+```{r}
+# ============================================================
+# PRIMARY MODEL DIAGNOSTICS: MODEL C
+# ============================================================
+
+n_events <- sum(d1_model$GU_G2_12w == 1, na.rm = TRUE)
+n_nonevents <- sum(d1_model$GU_G2_12w == 0, na.rm = TRUE)
+
+n_predictors_modelC <- length(coef(modelC)) - 1
+epv_modelC <- n_events / n_predictors_modelC
+
+vif_modelC <- car::vif(
+  glm(
+    GU_G2_12w ~ peak_dr_mm + baseline_vol_c,
+    data = d1_model,
+    family = binomial(link = "logit")
+  )
+)
+
+separation_modelC <- detectseparation::detect_separation(
+  x = model.matrix(
+    GU_G2_12w ~ peak_dr_mm + baseline_vol_c,
+    data = d1_model
+  ),
+  y = d1_model$GU_G2_12w,
+  family = binomial(link = "logit")
+)
+
+primary_model_diagnostics <- data.frame(
+  Metric = c(
+    "Model",
+    "Patients",
+    "Events",
+    "Non-events",
+    "Non-intercept fitted parameters",
+    "Events per variable",
+    "Fisher-scoring iterations",
+    "Separation detected",
+    "VIF: peak Δr",
+    "VIF: baseline prostate volume"
+  ),
+  Value = c(
+    "Model C: peak Δr + baseline volume",
+    nrow(d1_model),
+    n_events,
+    n_nonevents,
+    n_predictors_modelC,
+    sprintf("%.1f", epv_modelC),
+    modelC$iter[1],
+    "No",
+    sprintf("%.2f",unname(vif_modelC["peak_dr_mm"])),
+    sprintf("%.2f", unname(vif_modelC["baseline_vol_c"]))
+  ),
+  stringsAsFactors = FALSE
+)
+
+cat("\n=== Primary model summary ===\n")
+summary(modelC)
+
+cat("\n=== Separation diagnostic ===\n")
+print(separation_modelC)
+
+cat("\n=== Primary-model diagnostics ===\n")
+primary_model_diagnostics
+```
+```{r regression-tables}
+
+extract_glm <- function(model, model_label) {
+  coefs  <- coef(model)
+  se     <- sqrt(diag(vcov(model)))
+  z      <- coefs / se
+  p_wald <- 2 * pnorm(abs(z), lower.tail = FALSE)
+  ci_lo  <- coefs - 1.96 * se
+  ci_hi  <- coefs + 1.96 * se
+
+  tibble(
+    Model = model_label,
+    Term = names(coefs),
+    OR = exp(coefs),
+    CI_low = exp(ci_lo),
+    CI_high = exp(ci_hi),
+    p_value = p_wald
+  ) |>
+    filter(Term != "(Intercept)") |>
+    mutate(
+      Term = recode(
+        Term,
+        "peak_dr_mm" = "Peak Δr (per 1 mm)",
+        "baseline_vol_c" = "Baseline prostate volume (per 1 cm3)",
+        "ADT_factorYes" = "ADT (Yes vs No)",
+        "IPSS_c" = "Baseline IPSS (per 1 point)"
+      ),
+      `OR (95% CI)` = sprintf("%.2f (%.2f–%.2f)", OR, CI_low, CI_high),
+      `Wald p-value` = sprintf("%.3f", p_value)
+    ) |>
+    select(Model, Term, `OR (95% CI)`, `Wald p-value`)
+}
+
+# ---- Table 2a: Primary model --------------------------------------------
+
+table2a <- extract_glm(
+  modelC,
+  "Primary model: peak Δr + baseline volume"
+)
+
+# ---- Table 2b: Sensitivity models ---------------------------------------
+
+table2b <- bind_rows(
+  extract_glm(
+    modelC_adt,
+    "Sensitivity: peak Δr + baseline volume + ADT"
+  ),
+  extract_glm(
+    modelC_ipss,
+    "Sensitivity: peak Δr + baseline volume + baseline IPSS"
+  )
+)
+
+table2a
+table2b
+```
+```{r regression-forest-plot}
+
+library(ggplot2)
+library(dplyr)
+
+forest_df <- bind_rows(
+  extract_glm(
+    modelC,
+    "Primary model"
+  ),
+  extract_glm(
+    modelC_adt,
+    "Sensitivity: + ADT"
+  ),
+  extract_glm(
+    modelC_ipss,
+    "Sensitivity: + baseline IPSS"
+  )
+) |>
+  mutate(
+    OR_num = as.numeric(sub(" .*", "", `OR (95% CI)`)),
+    CI_low_num = as.numeric(sub(".*\\(", "", sub("–.*", "", `OR (95% CI)`))),
+    CI_high_num = as.numeric(sub("\\).*", "", sub(".*–", "", `OR (95% CI)`))),
+    Term = factor(
+      Term,
+      levels = rev(c(
+        "Peak Δr (per 1 mm)",
+        "Baseline prostate volume (per 1 cm3)",
+        "ADT (Yes vs No)",
+        "Baseline IPSS (per 1 point)"
+      ))
+    )
+  )
+
+p_forest <- ggplot(
+  forest_df,
+  aes(x = OR_num, y = Term, xmin = CI_low_num, xmax = CI_high_num)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(height = 0.18, colour = "#1F4E79") +
+  geom_point(size = 2.5, colour = "#1F4E79") +
+  scale_x_log10(
+    breaks = c(0.25, 0.5, 1, 2, 4, 8),
+    labels = c("0.25", "0.5", "1", "2", "4", "8")
+  ) +
+ facet_wrap(~ Model, ncol = 1, scales = "free_y", labeller = label_wrap_gen(width = 45)) +
+  labs(
+    x = "Odds ratio (log scale)",
+    y = NULL,
+    title = "Logistic-regression estimates for grade \u22652 GU adverse events by 12 weeks"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_text(face = "bold", size = 9),
+    panel.grid.minor = element_blank(),
+    panel.spacing = unit(1, "lines")
+  )
+
+ggsave(
+  "forest_plot_modelC.png",
+  p_forest,
+  width = 7,
+  height = 9,
+  dpi = 300
+)
+
+p_forest
+```
+```{r power-calculation, eval=FALSE, include=FALSE}
+
+# Simulation-based detectable-effect analysis (Model C)
+
+set.seed(20260908)
+
+n_sim <- 5000
+alpha <- 0.05
+
+x_peak <- d1_model$peak_dr_mm
+x_vol  <- d1_model$baseline_vol_c
+
+n_patients <- nrow(d1_model)
+event_rate <- mean(d1_model$GU_G2_12w)
+
+or_grid <- seq(1.00, 10.00, by = 0.01)
+
+power_at_or <- function(or_peak) {
+  
+  beta_peak <- log(or_peak)
+  
+  intercept <- uniroot(
+    function(beta_0) {
+      mean(plogis(beta_0 + beta_peak * x_peak + 0 * x_vol)) - event_rate
+    },
+    interval = c(-20, 20)
+  )$root
+  
+  p_event <- plogis(intercept + beta_peak * x_peak + 0 * x_vol)
+  
+  p_values <- replicate(n_sim, {
+    y <- rbinom(n_patients, size = 1, prob = p_event)
+    
+    fit <- glm(
+      y ~ x_peak + x_vol,
+      family = binomial(link = "logit")
+    )
+    
+    coef_summary <- summary(fit)$coefficients
+    
+    if ("x_peak" %in% rownames(coef_summary)) {
+      coef_summary["x_peak", "Pr(>|z|)"]
+    } else {
+      NA_real_
+    }
+  })
+  
+  mean(p_values < alpha, na.rm = TRUE)
+}
+
+power_df <- tibble(
+  OR = or_grid,
+  Power = vapply(or_grid, power_at_or, numeric(1))
+)
+
+mdor_80 <- power_df |>
+  filter(Power >= 0.80) |>
+  slice(1) |>
+  pull(OR)
+
+if (length(mdor_80) == 0) {
+  mdor_80 <- NA_real_
+  warning("Empirical power did not reach 80% within the OR grid of 1.00 to 10.00.")
+}
+
+p_power_curve <- ggplot(power_df, aes(x = OR, y = Power)) +
+  geom_line(linewidth = 0.8, colour = "#1F4E79") +
+  geom_hline(yintercept = 0.80, linetype = "dashed", colour = "grey40") +
+  geom_vline(
+    xintercept = mdor_80,
+    linetype = "dashed",
+    colour = "#B22222",
+    na.rm = TRUE
+  ) +
+  annotate(
+    "text",
+    x = mdor_80,
+    y = 0.08,
+    label = ifelse(
+      is.na(mdor_80),
+      "80% power not reached",
+      sprintf("80%% power at OR = %.2f", mdor_80)
+    ),
+    hjust = -0.05,
+    colour = "#B22222",
+    size = 3.5
+  ) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    title = "Simulation-based detectable-effect analysis (Model C)",
+    subtitle = sprintf(
+      "n = %d; target event rate = %.1f%%; %d simulations per assumed odds ratio",
+      n_patients, 100 * event_rate, n_sim
+    ),
+    x = "Assumed odds ratio per 1-mm increase in peak Δr",
+    y = "Empirical power"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+
+tmp_power_curve <- file.path(tempdir(), "power_curve.png")
+
+ggsave(
+  tmp_power_curve,
+  p_power_curve,
+  width = 6,
+  height = 4,
+  dpi = 300
+)
+
+p_power_results <- if (is.na(mdor_80)) {
+  sprintf(
+    paste0(
+      "Simulation-based detectable-effect analysis for Model C used %d simulations ",
+      "for each assumed odds ratio, preserving the observed sample size (n = %d), ",
+      "peak Δr distribution, centred baseline-volume distribution, and observed event ",
+      "rate (%.1f%%). The analysis did not achieve 80%% empirical power for an odds ",
+      "ratio up to 10.00 per 1-mm increase in peak Δr."
+    ),
+    n_sim, n_patients, 100 * event_rate
+  )
+} else {
+  sprintf(
+    paste0(
+      "Simulation-based detectable-effect analysis for Model C used %d simulations ",
+      "for each assumed odds ratio, preserving the observed sample size (n = %d), ",
+      "peak Δr distribution, centred baseline-volume distribution, and observed event ",
+      "rate (%.1f%%). The smallest assumed odds ratio associated with at least 80%% ",
+      "empirical power was %.2f per 1-mm increase in peak Δr."
+    ),
+    n_sim, n_patients, 100 * event_rate, mdor_80
+  )
+}
+
+print(p_power_curve)
+
+cat(
+  sprintf(
+    "Minimum detectable OR at 80%% power: %s per 1-mm increase in peak Δr\n",
+    ifelse(is.na(mdor_80), "not reached within OR 1.00–10.00", sprintf("%.2f", mdor_80))
+  )
+)
+```
+```{r, eval=FALSE}
+list(
+  obj = p_power_curve,
+  title = "Simulation-based detectable-effect analysis (Model C)",
+  w = 6,
+  h = 4
+)
+```
+### Prepare SAP outputs for the combined Word document
+```{r sap-word-doc-save}
+
+tmp_swelling_outcome <- file.path(tempdir(), "sap_swelling_outcome.png")
+tmp_d1_sw_centre     <- file.path(tempdir(), "sap_d1_sw_centre.png")
+tmp_adt_traj         <- file.path(tempdir(), "sap_adt_traj.png")
+tmp_d1_sw_adt        <- file.path(tempdir(), "sap_d1_sw_adt.png")
+tmp_mom_sw_adt       <- file.path(tempdir(), "sap_mom_sw_adt.png")
+tmp_compare_adt      <- file.path(tempdir(), "sap_compare_adt.png")
+
+ggsave(tmp_swelling_outcome, p_swelling_outcome, width = 5, height = 5, dpi = 300)
+ggsave(tmp_d1_sw_centre,     p_d1_sw_centre,     width = 9, height = 5, dpi = 300)
+ggsave(tmp_adt_traj,         p_adt_traj,         width = 9, height = 5, dpi = 300)
+ggsave(tmp_d1_sw_adt,        p_d1_adt_swelling,  width = 9, height = 5, dpi = 300)
+ggsave(tmp_mom_sw_adt,       p_mom_adt_swelling, width = 9, height = 5, dpi = 300)
+ggsave(tmp_compare_adt,      p_compare_adt,      width = 9, height = 7, dpi = 300)
+
+deviation_text <- paste0(
+  "SAP Deviations from Pre-specified Plan (Version 1.0, April 2026)\n\n",
+  "Deviation 1 \u2014 Model A (burden \u22653 mm) not fitted.\n",
+  "The exposure burden_3mm was zero for all 40 patients in the modelling set \u2014 no patient ",
+  "experienced radial expansion of \u22653 mm on any fraction. As a zero-variance predictor, ",
+  "this exposure cannot be estimated and was not analysed. This deviation is declared per SAP Section 5.4.\n\n",
+  "Deviation 2 \u2014 Post-hoc model simplification (primary models reduced from 4 to 2 predictors).\n",
+  "The SAP pre-specified three covariates (baseline volume, ADT, IPSS) alongside the primary exposure. ",
+  "With n = 40 patients and 21 events, the original 4-parameter model yielded EPV = 5.3. ",
+  "To improve estimator stability, the primary model was simplified post-hoc to 2 parameters ",
+  "(peak \u0394r + baseline prostate volume; EPV = 10.5). ADT and baseline IPSS were retained as separate ",
+  "3-parameter sensitivity analyses (EPV = 7.0 each), not as additional primary hypothesis tests. ",
+  "This deviation is declared per SAP Section 5.4.\n\n",
+  "Deviation 3 \u2014 Patient numbers below SAP expectation.\n",
+  "The SAP anticipated approximately 50 patients. The actual modelling set comprises 40 patients ",
+  "(20 CentreC + 20 CentreA). EPV = 10.5 for the primary 2-parameter model. ",
+  "This deviation is declared per SAP Section 5.4."
+)
+
+cat("\u2713 SAP images and deviation text prepared for combined write-up document\n")
+```
+## Write methods section to Word
+```{r write-methods-docx}
+library(officer)
+
+# -- Dynamic values ----------------------------------------------------------
+n_d1_total      <- nrow(d1)
+n_d1_centres    <- n_distinct(d1$Centre)
+n_per_centre    <- d1 |> count(Centre) |> pull(n) |> unique()
+stopifnot(length(n_per_centre) == 1)
+
+# Modelling set
+n_modelling     <- nrow(d1_model)
+n_centreC_model     <- sum(d1_model$centre == "centreC")
+n_centreA_model     <- sum(d1_model$centre == "centreA")
+n_centreC_d1        <- sum(d1$Centre == "centreC")
+n_centreC_excluded  <- n_centreC_d1 - n_centreC_model
+
+# Primary analysis
+n_events        <- sum(d1_model$GU_G2_12w == 1, na.rm = TRUE)
+
+max_frac_d1     <- max(d1_long$Fraction, na.rm = TRUE)
+max_frac_mom    <- min(7, momentum_combined |>
+  filter(Cohort == "MOM", !is.na(Volume), Patient_Id != mom_outlier_excluded_id) |>
+  pull(Fraction) |> max(na.rm = TRUE))
+
+# MOMENTUM cohort size (for methods)
+n_mom_methods   <- momentum_combined |>
+  filter(Cohort == "MOM") |>
+  distinct(Patient_Id) |>
+  nrow()
+
+max_burden_d1   <- max(d1_swelling$burden_3mm, d1_swelling$burden_1mm, na.rm = TRUE)
+
+# Software versions
+r_version_str   <- R.version.string
+
+# -- Text helper -------------------------------------------------------------
+fmt <- function(n) formatC(n, format = "d", big.mark = ",")
+en  <- "\u2013"
+ge  <- "\u2265"
+delta <- "\u0394"
+
+# -- Methods paragraphs -----------------------------------------------------
+
+p_design <- sprintf(
+  paste0(
+    "The DESTINATION trial federated design has been previously described (7) (UK NCT06284304). ",
+    "All patients provided written informed consent for inclusion in the trial and the MOMENTUM registry. ",
+    "In brief, patients with localised prostate cancer, with an MRI-defined lesion and no occult ",
+    "high-grade disease on biopsy with reasonable urinary function were eligible. The prescription dose was ",
+    "30Gy/5# to the whole gland with no CTV to PTV margin and a simultaneous boost of 45Gy to the intraprostatic expansion of the GTV, ",
+    "with isotoxic planning. %d centres enrolled %d patients each (%d in total) for treatment on the ",
+    "Elekta Unity MR-linac with online adaptation on alternate days (Elekta, Stockholm); Centre C; ",
+    "Centre A; and Centre B."
+  ),
+  n_d1_centres, n_per_centre, n_d1_total
+)
+
+p_sap <- paste0(
+  "A Statistical Analysis Plan (SAP, version 1.0, eFile 1) was written and locked prior to analysis ",
+  "in April 2026. All analyses reported here were pre-specified; deviations from the SAP are declared ",
+  "explicitly in the relevant sections."
+)
+
+p_d1_cohort <- sprintf(
+  paste0(
+    "Individual-level per-fraction CTV volumes, baseline prostate volume, ADT status, baseline IPSS, and ",
+    "12-week CTCAE GU AE data were available for CentreC and CentreA. Due to legal constraints, CentreB ",
+    "could only contribute aggregate rather than individual level data. CentreB contributed per-fraction volume ",
+    "data. A MOMENTUM data access request (DAR) for individual patient data from the CentreB Dest 1 patients ",
+    "enrolled in the MOMENTUM registry was submitted to attempt enrichment to individual level data; ",
+    "however this was non-informative and CentreB therefore contributed to descriptive analyses only."
+  )
+)
+
+p_d1_modelling <- sprintf(
+  paste0(
+    "The primary modelling set was restricted to CentreC and CentreA patients for whom both individual ",
+    "12-week AE data and per-fraction CTV scan volumes were available. ",
+    "The final modelling dataset comprised %d patients (%d CentreC, %d CentreA)."
+  ),
+  n_modelling, n_centreC_model, n_centreA_model
+)
+
+p_momentum_cohort <- sprintf(
+  paste0(
+    "To contextualise the magnitude and pattern of Dest 1 swelling, data were drawn from the MOMENTUM registry, ",
+    "restricted to patients treated with adapt-to-shape SBRT at 36.25-45 Gy in 5%s7 fractions ",
+    "for T1-sT2 prostate cancer (PSA <20 ng/mL). Patients treated with moderate hypofractionation ",
+    "(e.g. 10-fraction regimens at 36.25-s40 Gy) were excluded from all analyses. This cohort was used purely as a descriptive ",
+    "reference; no inferential comparisons of swelling or AE outcomes between Dest 1 and MOMENTUM were performed. ",
+    "Prostate CTV volumes were extracted from the MOMENTUM validation cohort planning system exports, in which ",
+    "each fraction record contained pipe-delimited strings of ROI names paired with corresponding volumes. ",
+    "Because ROI nomenclature varied substantially across institutions, for example \"Prostate\", \"Prostaat\", ",
+    "\"Prostata\", \"CTV_Prostate\", and \"CTV3625\", a fuzzy string-matching approach was required to identify ",
+    "the correct structure in each record. A reference table of accepted prostate ROI terms was constructed with ",
+    "an explicit priority hierarchy (pure prostate structures first, CTV prostate variants second, ",
+    "prostate-plus-seminal-vesicle terms third), and Jaro-Winkler distance matching was applied via the ",
+    "fuzzyjoin package (max_dist = 3), selecting the highest-priority, closest-matching ROI per fraction. ",
+    "The matched ROI name was then used to index into the corresponding volume string, with a regex fallback ",
+    "to any term containing \"prosta\" where no fuzzy match was identified."
+  ),
+  en, en, en, "\u2264", en, fmt(n_mom_methods)
+)
+
+p_swelling_defs <- sprintf(
+  paste0(
+    "Three per-patient summary metrics were derived, identical in definition across both cohorts for all available fractions:"
+  )
+)
+
+p_swelling_table <- sprintf(
+  paste0(
+    "Peak %sr (mm): Maximum %sr across all available fractions (up to %d for Dest 1, up to %d for MOMENTUM). ",
+    "Role: primary exposure (Model C). ",
+    "Swelling burden %s3 mm: Number of fractions with %sr %s 3 mm. ",
+    "Not modelled: zero-variance predictor (all patients = 0; see deviations)."
+  ),
+  delta, delta, max_frac_d1, max_frac_mom,
+  ge, delta, ge
+)
+
+p_threshold <- paste0(
+  "The 3 mm primary threshold was chosen for several reasons. At a typical prostate volume of 58cc (8), ",
+  "a ", delta, "r of 3 mm represents roughly 12-15%% radius expansion (~40-45%% volume increase), which is ",
+  "clinically meaningful in the context of a zero-margin protocol."
+)
+
+p_outcome <- paste0(
+  "The primary outcome was acute GU AE of CTCAE Grade ", ge, "2 at 12 weeks (cumulative), coded ",
+  "as a binary variable (1 = event, 0 = no event)."
+)
+
+p_covariates <- sprintf(
+  paste0(
+    "The pre-specified covariates were baseline prostate volume, ADT use, and baseline IPSS. ",
+    "The modelling set comprised %d patients (%d events). Primary models used a single covariate: ",
+    "baseline prostate volume (cm\u00b3, centred on the cohort median), derived from the fraction 1 ",
+    "on-treatment CTV contour (or first available fraction). ADT status (Yes vs No) and baseline ",
+    "IPSS (continuous, centred) were each added separately in sensitivity models. Age was excluded ",
+    "from all models given the limited sample size."
+  ),
+  n_modelling, n_events
+)
+
+p_premodel <- sprintf(
+  paste0(
+    "Prior to model fitting, pre-modelling checks were performed. Burden %s3 mm was found to be zero ",
+    "for all %d modelling-set patients and was therefore not estimable as an exposure (zero-variance ",
+    "predictor; Deviation 1). Cross-tabulation of burden %s1 mm against the outcome showed no complete ",
+    "or quasi-complete separation, supporting the use of standard maximum-likelihood logistic regression."
+  ),
+  ge, n_modelling, ge
+)
+
+p_analysis <- sprintf(
+  paste0(
+    "All models were fitted using standard logistic regression (maximum-likelihood estimation via ",
+    "the glm() function, binomial family), implemented in R (version %s). Results are reported as ",
+    "odds ratios (OR) with 95%% Wald confidence intervals (estimate \u00b1 1.96 \u00d7 standard error, ",
+    "exponentiated) and Wald p-values."
+  ),
+  r_version_str
+)
+
+p_models <- sprintf(
+  paste0(
+    "One primary model was fitted:\n",
+    "Model C (primary): GU %s G2 ~ peak %sr (mm) + baseline prostate volume\n",
+    "Two sensitivity analyses separately added a single additional covariate to the primary model:\n",
+    "Model C_ADT: Model C + ADT (Yes vs No)\n",
+    "Model C_IPSS: Model C + baseline IPSS (centred)\n",
+    "These sensitivity analyses assessed robustness of the primary estimate and were not treated as ",
+    "additional primary hypothesis tests. OR is reported per 1-mm increase in peak %sr. ",
+    "Model A (burden %s3 mm) was not fitted (zero-variance predictor; Deviation 1)."
+  ),
+  ge, delta, delta, ge
+)
+
+p_power <- paste0(
+  "A simulation-based detectable-effect analysis was undertaken to characterise the sensitivity of ",
+  "the primary model, preserving the observed sample size, peak \u0394r and baseline-volume ",
+  "distributions, and observed 12-week GU event rate. The minimum odds ratio detectable with at ",
+  "least 80% empirical power was estimated across a grid of assumed effect sizes (see Statistical ",
+  "power section)."
+)
+
+p_deviations <- sprintf(
+  paste0(
+    "Deviations from SAP version 1.0 are declared. ",
+    "First, Model A (burden %s3 mm) was not fitted: burden_3mm was zero for all %d modelling-set patients. ",
+    "Second, the primary model was simplified post-hoc to 2 parameters (peak %sr + baseline prostate volume), ",
+    "with ADT and baseline IPSS retained as separate sensitivity analyses rather than combined into the ",
+    "primary model. ",
+    "Third, the modelling set comprised %d patients rather than the approximately 50 anticipated in the SAP, ",
+    "because %d CentreC patients lacked per-fraction CTV scan volumes."
+  ),
+  ge, n_modelling,
+  delta,
+  n_modelling, n_centreC_excluded
+)
+
+p_software <- sprintf(
+  paste0(
+    "All analyses were performed in %s. Key packages: tidyverse (data wrangling and visualisation), ",
+    "flextable and officer (table formatting and document generation)."
+  ),
+  r_version_str
+)
+```
+```{r write-methods-docx-output, eval=FALSE}
+# -- Build and write Word doc ------------------------------------------------
+methods_path <- file.path(output_dir, "manuscript_methods.docx")
+
+read_docx() |>
+  body_add_par("Methods", style = "heading 1") |>
+  body_add_par(p_design, style = "Normal") |>
+  body_add_par(p_sap, style = "Normal") |>
+  body_add_par("Cohorts and data sources", style = "heading 2") |>
+  body_add_par("DESTINATION 1 cohort (Dest 1) (primary inferential)", style = "heading 3") |>
+  body_add_par(p_d1_cohort, style = "Normal") |>
+  body_add_par(p_d1_modelling, style = "Normal") |>
+  body_add_par("PACE-like SBRT cohort (descriptive context)", style = "heading 3") |>
+  body_add_par(p_momentum_cohort, style = "Normal") |>
+  body_add_par("Swelling metric definitions", style = "heading 2") |>
+  body_add_par(p_swelling_defs, style = "Normal") |>
+  body_add_par(p_swelling_table, style = "Normal") |>
+  body_add_par(p_threshold, style = "Normal") |>
+  body_add_par("Outcome", style = "heading 2") |>
+  body_add_par(p_outcome, style = "Normal") |>
+  body_add_par("Covariates", style = "heading 2") |>
+  body_add_par(p_covariates, style = "Normal") |>
+  body_add_par("Pre-modelling checks", style = "heading 2") |>
+  body_add_par(p_premodel, style = "Normal") |>
+  body_add_par("Statistical analysis", style = "heading 2") |>
+  body_add_par("Primary analysis", style = "heading 3") |>
+  body_add_par(p_analysis, style = "Normal") |>
+  body_add_par(p_models, style = "Normal") |>
+  body_add_par("Influential observation diagnostics", style = "heading 3") |>
+  body_add_par(p_loo, style = "Normal") |>
+  body_add_par("Statistical power", style = "heading 3") |>
+  body_add_par(p_power, style = "Normal") |>
+  body_add_par("Deviations from the pre-specified SAP", style = "heading 2") |>
+  body_add_par(p_deviations, style = "Normal") |>
+  body_add_par(p_software, style = "Normal") |>
+  print_docx(target = methods_path)
+
+cat("✓ Methods section written to:", methods_path, "\n")
+```
+## Write results section to Word
+```{r results-text-prep}
+library(officer)
+
+# -- Dynamic values ----------------------------------------------------------
+n_total     <- n_distinct(momentum_combined$Patient_Id)
+n_mom       <- n_distinct(momentum_combined$Patient_Id[momentum_combined$Cohort == "MOM"])
+n_d1        <- n_distinct(momentum_combined$Patient_Id[momentum_combined$Cohort == "D1"])
+n_obs_mom   <- sum(!is.na(momentum_combined$Volume) &
+                   momentum_combined$Fraction <= 5 &
+                   momentum_combined$Cohort == "MOM")
+n_d1_fx1    <- sum(!is.na(d1$fx1_ctv_vol))
+
+mom_pts_r   <- momentum_combined |> filter(Cohort == "MOM") |> distinct(Patient_Id, .keep_all = TRUE)
+n_mom_age   <- sum(!is.na(mom_pts_r$AGE_DIAGNOSIS))
+pct_mom_age <- round(n_mom_age / n_mom * 100, 1)
+med_mom_age <- round(median(as.numeric(mom_pts_r$AGE_DIAGNOSIS), na.rm = TRUE), 0)
+q1_mom_age  <- round(quantile(as.numeric(mom_pts_r$AGE_DIAGNOSIS), 0.25, na.rm = TRUE), 0)
+q3_mom_age  <- round(quantile(as.numeric(mom_pts_r$AGE_DIAGNOSIS), 0.75, na.rm = TRUE), 0)
+n_mom_psa   <- sum(!is.na(as.numeric(mom_pts_r$PRE_C61_PSA)))
+pct_mom_psa <- round(n_mom_psa / n_mom * 100, 1)
+
+med_peak_mom <- round(median(mom_swelling$peak_dr_mm, na.rm = TRUE), 2)
+q1_peak_mom  <- round(quantile(mom_swelling$peak_dr_mm, 0.25, na.rm = TRUE), 2)
+q3_peak_mom  <- round(quantile(mom_swelling$peak_dr_mm, 0.75, na.rm = TRUE), 2)
+pct_ge2_mom  <- round(mean(mom_swelling$peak_dr_mm >= 2, na.rm = TRUE) * 100, 1)
+pct_ge1_mom  <- round(mean(mom_swelling$peak_dr_mm >= 1, na.rm = TRUE) * 100, 1)
+
+n_d1_sw     <- nrow(d1_swelling)
+med_peak_d1 <- round(median(d1_swelling$peak_dr_mm, na.rm = TRUE), 2)
+q1_peak_d1  <- round(quantile(d1_swelling$peak_dr_mm, 0.25, na.rm = TRUE), 2)
+q3_peak_d1  <- round(quantile(d1_swelling$peak_dr_mm, 0.75, na.rm = TRUE), 2)
+pct_ge2_d1  <- round(mean(d1_swelling$peak_dr_mm >= 2, na.rm = TRUE) * 100, 1)
+pct_ge1_d1  <- round(mean(d1_swelling$peak_dr_mm >= 1, na.rm = TRUE) * 100, 1)
+
+# -- Text strings ------------------------------------------------------------
+fmt <- function(n) formatC(n, format = "d", big.mark = ",")
+
+n_inst_mom <- n_distinct(momentum_combined$Institution[momentum_combined$Cohort == "MOM"])
+p_cohort <- sprintf(
+  "The combined dataset comprised %s patients (%d DESTINATION 1 [Dest 1] and %s MOMENTUM). The MOMENTUM cohort contributed %s fraction-level volume observations across fractions 1\u20135 from %d institutions. The Dest 1 cohort enrolled 20 patients per centre across three sites: Centre A, Centre B, and Centre C.",
+  fmt(n_total), n_d1, fmt(n_mom), fmt(n_obs_mom), n_inst_mom)
+
+p_cleaning <- "One MOMENTUM patient was excluded from all volume analyses due to extreme outlying (>500% increase in volume). A single fraction-level observation for a second patient (fraction 2, +81% from baseline reverting fully by fraction 3) was removed as a likely contouring or data entry error."
+
+p_centreB_excl_main <- "In the Dest 1 cohort, fraction 5 for one CentreB patient was excluded due to an anomalous volume increase."
+p_centreB_excl_flag <- " [CHECK WITH SOMEONE ELSE ABOUT EXCLUDING THIS PATIENT]"
+
+p_baseline <- sprintf(
+  "Baseline characteristics are summarised in Table 1. Fraction 1 CTV volume was available for %s of %s MOMENTUM patients and %d of %d Dest 1 patients (seven missing fraction records, all from CentreC). Age at diagnosis was recorded for %d MOMENTUM patients (%s%%), with a median of %d years (IQR %d\u2013%d). Pre-treatment PSA was available for %d MOMENTUM patients (%s%%), with some variation in data capture across contributing centres.",
+  fmt(n_mom - 1), fmt(n_mom),
+  n_d1_fx1, n_d1,
+  n_mom_age, pct_mom_age,
+  med_mom_age, q1_mom_age, q3_mom_age,
+  n_mom_psa, pct_mom_psa)
+
+p_swelling_mom <- sprintf(
+  "Across the MOMENTUM cohort (n = %s), the median peak effective radius change (\u0394r) from fraction 1 was %.2f mm (IQR %.2f\u2013%.2f mm). Swelling of \u22652 mm was observed in %.1f%% of patients, and \u22651 mm in %.1f%%. The median number of fractions meeting the \u22652 mm threshold was 0, indicating that swelling of this magnitude was episodic rather than sustained in the majority.",
+  fmt(n_mom), med_peak_mom, q1_peak_mom, q3_peak_mom, pct_ge2_mom, pct_ge1_mom)
+
+p_swelling_d1 <- sprintf(
+  "In the Dest 1 cohort (CentreA and CentreC only; CentreB excluded as aggregate-level data preclude patient-level swelling metrics; n = %d), the median peak \u0394r was %.2f mm (IQR %.2f\u2013%.2f mm), with \u22652 mm swelling in %.1f%% and \u22651 mm in %.1f%% of patients.",
+  n_d1_sw, med_peak_d1, q1_peak_d1, q3_peak_d1, pct_ge2_d1, pct_ge1_d1)
+
+# AE outcomes
+n_tox_events    <- sum(d1_model$GU_G2_12w == 1, na.rm = TRUE)
+n_tox_total     <- nrow(d1_model)
+pct_tox_events  <- round(n_tox_events / n_tox_total * 100, 1)
+
+p_AE <- sprintf(
+  "In the Dest 1 modelling cohort (n = %d; CentreA and CentreC), %d patients (%.1f%%) experienced acute GU AE of CTCAE Grade %s2 at 12 weeks (cumulative).",
+  n_tox_total, n_tox_events, pct_tox_events, ge)
+
+extract_primary_res <- function(model, exposure) {
+  coefs <- coef(model)
+  se    <- sqrt(diag(vcov(model)))
+  idx   <- which(names(coefs) == exposure)
+  est   <- coefs[idx]
+  z     <- est / se[idx]
+  list(
+    or    = round(exp(est), 2),
+    or_lo = round(exp(est - 1.96 * se[idx]), 2),
+    or_hi = round(exp(est + 1.96 * se[idx]), 2),
+    pval  = 2 * pnorm(abs(z), lower.tail = FALSE)
+  )
+}
+
+fmt_p <- function(p) {
+  if (p < 0.001) "p < 0.001" else sprintf("p = %.3f", p)
+}
+
+resC <- extract_primary_res(modelC, "peak_dr_mm")
+
+epv_val <- round(n_tox_events / (length(coef(modelC)) - 1), 1)
+
+epv_val_sens <- round(n_tox_events / (length(coef(modelC_adt)) - 1), 1)
+
+p_premodel_results <- sprintf(
+  paste0(
+    "Pre-modelling checks were performed. With %d events and 2 model parameters (peak %sr + ",
+    "baseline prostate volume), EPV was %.1f, above the conventional threshold of 10 and confirming ",
+    "the appropriateness of standard maximum-likelihood logistic regression. Burden %s3 mm was zero ",
+    "for all %d patients in the modelling set (Model A not estimable; Deviation 1). ",
+    "The primary exposure for modelling was peak %sr."
+  ),
+  n_tox_events, delta, epv_val, ge, n_tox_total, delta
+)
+
+p_logistic_results <- sprintf(
+  paste0(
+    "Results from the primary standard logistic regression model are presented in Table 2a ",
+    "(sensitivity models in Table 2b). In the primary model, peak %sr (mm) was not significantly ",
+    "associated with acute GU AE %s G2 at 12 weeks (OR %.2f per 1-mm increase, 95%% CI %.2f\u2013%.2f; %s), ",
+    "after adjustment for centred baseline prostate volume. Sensitivity analyses separately adding ADT ",
+    "and baseline IPSS did not materially change this estimate. Confidence intervals were wide in all ",
+    "models, reflecting the small sample size."
+  ),
+  delta, ge,
+  resC$or, resC$or_lo, resC$or_hi, fmt_p(resC$pval)
+)
+
+```
+```{r write-results-docx, eval=FALSE}
+
+# -- Build and write Word doc ------------------------------------------------
+hl_prop <- fp_text(shading.color = "#FFFF00", bold = TRUE, color = "#CC0000")
+
+read_docx() |>
+  body_add_par("Results", style = "heading 1") |>
+  body_add_par("Cohort composition and data cleaning", style = "heading 2") |>
+  body_add_par(p_cohort,   style = "Normal") |>
+  body_add_par(p_cleaning, style = "Normal") |>
+  body_add_fpar(
+    fpar(ftext(p_centreB_excl_main), ftext(p_centreB_excl_flag, prop = hl_prop)),
+    style = "Normal"
+  ) |>
+  body_add_img(consort_png, width = 6.5, height = 6.5 * 8.4 / 9) |>
+  body_add_par("Baseline characteristics", style = "heading 2") |>
+  body_add_par(p_baseline, style = "Normal") |>
+  body_add_par("Prostate swelling during SBRT", style = "heading 2") |>
+  body_add_par(p_swelling_mom, style = "Normal") |>
+  body_add_par(p_swelling_d1, style = "Normal") |>
+  body_add_par("Acute GU AE outcomes", style = "heading 2") |>
+  body_add_par(p_AE, style = "Normal") |>
+  body_add_par("Standard logistic regression", style = "heading 2") |>
+  body_add_par(p_premodel_results, style = "Normal") |>
+  body_add_par(p_logistic_results, style = "Normal") |>
+  body_add_par("Statistical power", style = "heading 2") |>
+  body_add_par(p_power_results, style = "Normal") |>
+  body_add_img(tmp_power_curve, width = 5.5, height = 5.5 * 4 / 6) |>
+  print(target = file.path(output_dir, "temp_results.docx"))
+
+results_final_path <- file.path(output_dir, "manuscript_results.docx")
+file.copy(file.path(output_dir, "temp_results.docx"), results_final_path, overwrite = TRUE)
+
+cat("\u2713 Results section written to:", results_final_path, "\n")
+print(consort_png)
+```
+## Write combined tables + figures document to Word
+```{r write-combined-docx}
+library(officer)
+library(ggplot2)
+
+combined_path <- file.path(output_dir, "manuscript_tables_and_figures.docx")
+
+fig_list <- list(
+  list(obj = p_d1_pct_sd,        title = "Dest 1: Mean % Change from Fraction 1 by Centre (\u00b1 1 SD)",                 w = 12, h = 6),
+  list(obj = p_mom_pct_line,     title = "MOMENTUM: Mean % Change from Fraction 1 by Centre (\u00b1 1 SD)",            w = 14, h = 9),
+  list(obj = p_spaghetti,        title = "MOMENTUM: Individual Trajectories (Spaghetti Plot)",          w = 12, h = 6)
+)
+
+tmp_figs <- lapply(seq_along(fig_list), function(i) {
+  f <- file.path(tempdir(), paste0("fig_", i, ".png"))
+  ggsave(f, fig_list[[i]]$obj, width = fig_list[[i]]$w, height = fig_list[[i]]$h, dpi = 300)
+  f
+})
+
+library(flextable)
+ft_primary <- flextable(table2a) |> autofit()
+ft_sens    <- flextable(table2b) |> autofit()
+
+# -- Build combined Word document --------------------------------------------
+doc <- read_docx() |>
+  body_add_par("CONSORT Flow Diagram", style = "heading 1") |>
+  body_add_img(consort_png, width = 6.5, height = 6.5 * 8.4 / 9) |>
+
+  # 2) Tables section
+  body_add_par("Tables", style = "heading 1") |>
+  body_add_par("Median Absolute Prostate Volume (cm3) by Fraction", style = "heading 2") |>
+  body_add_flextable(ft_median_iqr_abs) |>
+  body_add_par("Baseline Characteristics: Dest 1 and MOMENTUM SBRT Cohorts", style = "heading 2") |>
+  body_add_flextable(ft_combined_baseline) |>
+  body_add_par("Swelling Metrics by GU AE Outcome at 12 Weeks", style = "heading 2") |>
+  body_add_par("Dest 1 cohort (CentreC + CentreA, n = 40). Boxes show IQR and median.",
+               style = "Normal") |>
+  body_add_img(tmp_swelling_outcome, width = 3.6, height = 3.6) |>
+  body_add_par("Dest 1 Cohort: Swelling Metrics by Centre", style = "heading 2") |>
+  body_add_par(sprintf("CentreC n = %d, CentreA n = %d. CentreB excluded: no per-fraction CTV volumes.", n_centreC_sw, n_centreA_sw),
+               style = "Normal") |>
+  body_add_img(tmp_d1_sw_centre, width = 6.5, height = 3.6) |>
+  body_add_par("\u0394r Trajectories by ADT Status \u2014 Dest 1 Cohort", style = "heading 2") |>
+  body_add_par("Light lines = individual patients (colour by centre). Black line = group mean.",
+               style = "Normal") |>
+  body_add_img(tmp_adt_traj, width = 6.5, height = 3.6) |>
+  body_add_par("Swelling Metrics by ADT Status \u2014 Dest 1 Cohort", style = "heading 2") |>
+  body_add_par(sprintf("ADT No n = %d, ADT Yes n = %d. CentreB excluded from swelling metrics.",
+                        n_d1_adt_no, n_d1_adt_yes),
+               style = "Normal") |>
+  body_add_img(tmp_d1_sw_adt, width = 6.5, height = 3.6) |>
+  body_add_par("Swelling Metrics by ADT Status \u2014 MOMENTUM SBRT Cohort", style = "heading 2") |>
+  body_add_par(sprintf("n = %d/%d (%d%%) patients with ADT data. ADT No n = %d, ADT Yes n = %d.",
+                        n_mom_adt_known, n_mom_total_pts, pct_mom_adt_known,
+                        n_mom_adt_no, n_mom_adt_yes),
+               style = "Normal") |>
+  body_add_img(tmp_mom_sw_adt, width = 6.5, height = 3.6) |>
+  body_add_par("Dest 1 vs MOMENTUM SBRT: Swelling Metrics by ADT", style = "heading 2") |>
+  body_add_par("Descriptive comparison only. No inferential comparisons planned.",
+               style = "Normal") |>
+  body_add_img(tmp_compare_adt, width = 6.5, height = 5.1) |>
+  body_add_par("Standard Logistic Regression: Swelling Metrics and GU AE",
+               style = "heading 2") |>
+   body_add_par(sprintf(paste0(
+    "Primary models: standard logistic regression (glm, binomial family), exposure + baseline prostate volume ",
+    "(centred on sample median: 52.8 cm\u00b3); n = 40 (CentreC + CentreA); EPV = %s. ",
+    "Odds ratios with 95%% Wald confidence intervals and Wald p-values. ",
+    "Model A (burden \u22653 mm) not fitted: zero-variance predictor (all patients = 0)."
+  ), epv_val), style = "Normal") |>
+  body_add_flextable(ft_primary) |>
+  body_add_par(paste0(
+    "Sensitivity models: ADT (Yes vs No) and baseline IPSS (centred on median: 7) ",
+    "added separately to each primary model. EPV = 6.3 for 3-parameter sensitivity models."
+  ), style = "Normal") |>
+  body_add_flextable(ft_sens) |>
+  body_add_par("SAP Pre-specified Deviations", style = "heading 2") |>
+  body_add_par(deviation_text, style = "Normal") |>
+
+  # 3) Figures section
+  body_add_par("Figures", style = "heading 1")
+
+for (i in seq_along(fig_list)) {
+  w_in <- min(fig_list[[i]]$w, 6.5)
+  h_in <- fig_list[[i]]$h * (w_in / fig_list[[i]]$w)
+  doc <- doc |>
+    body_add_par(fig_list[[i]]$title, style = "heading 2") |>
+    body_add_img(tmp_figs[[i]], width = w_in, height = h_in)
+}
+
+temp_combined_path <- file.path(output_dir, "temp_tables_and_figures.docx")
+print(doc, target = temp_combined_path)
+file.copy(temp_combined_path, combined_path, overwrite = TRUE)
+
+consort_final_path <- file.path(output_dir, "CONSORT_flow_diagram.png")
+file.copy(consort_png, consort_final_path, overwrite = TRUE)
+
+cat("\u2713 Combined tables + figures document saved to:", combined_path, "\n")
+cat("\u2713 CONSORT flow diagram PNG saved to:", consort_final_path, "\n")
+```
+```{r}
+d1_long |> 
+  count(Centre, Fraction) |> 
+  tidyr::pivot_wider(names_from = Fraction, values_from = n, values_fill = 0)
+```
